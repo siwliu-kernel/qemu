@@ -23,6 +23,7 @@
 #include "migration/blocker.h"
 #include "qemu/cutils.h"
 #include "qemu/main-loop.h"
+#include "sysemu/runstate.h"
 #include "cpu.h"
 #include "trace.h"
 #include "qapi/error.h"
@@ -429,6 +430,8 @@ static void vhost_vdpa_init_svq(struct vhost_dev *hdev, struct vhost_vdpa *v)
     v->shadow_vqs = g_steal_pointer(&shadow_vqs);
 }
 
+static int vhost_vdpa_set_backend_cap(struct vhost_dev *dev);
+
 static int vhost_vdpa_init(struct vhost_dev *dev, void *opaque, Error **errp)
 {
     struct vhost_vdpa *v;
@@ -440,6 +443,7 @@ static int vhost_vdpa_init(struct vhost_dev *dev, void *opaque, Error **errp)
     v->dev = dev;
     dev->opaque =  opaque ;
     v->listener = vhost_vdpa_memory_listener;
+    v->registered = false;
     v->msg_type = VHOST_IOTLB_MSG_V2;
     vhost_vdpa_init_svq(dev, v);
 
@@ -475,6 +479,17 @@ static int vhost_vdpa_init(struct vhost_dev *dev, void *opaque, Error **errp)
 
     vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_ACKNOWLEDGE |
                                VIRTIO_CONFIG_S_DRIVER);
+
+    if (runstate_check(RUN_STATE_INMIGRATE)) {
+        ret = vhost_vdpa_set_backend_cap(dev);
+        if (ret) {
+            ram_block_discard_disable(false);
+            error_report("Cannot negotiate vdpa backend features");
+            return ret;
+        }
+        memory_listener_register(&v->listener, &address_space_memory);
+        v->registered = true;
+    }
 
     return 0;
 }
@@ -603,7 +618,10 @@ static int vhost_vdpa_cleanup(struct vhost_dev *dev)
     }
 
     vhost_vdpa_host_notifiers_uninit(dev, dev->nvqs);
-    memory_listener_unregister(&v->listener);
+    if (v->registered) {
+        memory_listener_unregister(&v->listener);
+        v->registered = false;
+    }
     vhost_vdpa_svq_cleanup(dev);
 
     dev->opaque = NULL;
@@ -1168,7 +1186,10 @@ static int vhost_vdpa_dev_start(struct vhost_dev *dev, bool started)
     }
 
     if (started) {
-        memory_listener_register(&v->listener, &address_space_memory);
+        if (!v->registered) {
+            memory_listener_register(&v->listener, &address_space_memory);
+            v->registered = true;
+        }
         return vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_DRIVER_OK);
     }
 
@@ -1177,8 +1198,6 @@ static int vhost_vdpa_dev_start(struct vhost_dev *dev, bool started)
 
 static void vhost_vdpa_reset_status(struct vhost_dev *dev)
 {
-    struct vhost_vdpa *v = dev->opaque;
-
     if (!vhost_vdpa_last_dev(dev)) {
         return;
     }
@@ -1186,7 +1205,6 @@ static void vhost_vdpa_reset_status(struct vhost_dev *dev)
     vhost_vdpa_reset_device(dev);
     vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_ACKNOWLEDGE |
                                VIRTIO_CONFIG_S_DRIVER);
-    memory_listener_unregister(&v->listener);
 }
 
 static int vhost_vdpa_set_log_base(struct vhost_dev *dev, uint64_t base,

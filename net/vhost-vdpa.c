@@ -273,6 +273,11 @@ static void vhost_vdpa_net_log_global_enable(VhostVDPAState *s, bool enable)
      */
     vhost_net_stop(vdev, n->nic->ncs, data_queue_pairs, cvq);
 
+    if (v->registered) {
+        memory_listener_unregister(&v->listener);
+        v->registered = false;
+    }
+
     /* Start will check migration setup_or_active to configure or not SVQ */
     r = vhost_net_start(vdev, n->nic->ncs, data_queue_pairs, cvq);
     if (unlikely(r < 0)) {
@@ -336,9 +341,13 @@ static int vhost_vdpa_net_data_start(NetClientState *nc)
 static void vhost_vdpa_net_client_stop(NetClientState *nc)
 {
     VhostVDPAState *s = DO_UPCAST(VhostVDPAState, nc, nc);
+    struct vhost_vdpa *v = &s->vhost_vdpa;
     struct vhost_dev *dev;
 
     assert(nc->info->type == NET_CLIENT_DRIVER_VHOST_VDPA);
+
+    v->shadow_vqs_enabled = false;
+    v->shadow_data = false;
 
     if (s->vhost_vdpa.index == 0) {
         remove_migration_state_change_notifier(&s->migration_state);
