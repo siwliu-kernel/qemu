@@ -23,6 +23,7 @@
 #include "migration/blocker.h"
 #include "qemu/cutils.h"
 #include "qemu/main-loop.h"
+#include "sysemu/runstate.h"
 #include "cpu.h"
 #include "trace.h"
 #include "qapi/error.h"
@@ -168,7 +169,8 @@ static void vhost_vdpa_iotlb_batch_begin_once(struct vhost_vdpa *v)
 
 static void vhost_vdpa_listener_commit(MemoryListener *listener)
 {
-    struct vhost_vdpa *v = container_of(listener, struct vhost_vdpa, listener);
+    struct vhost_vdpa_listener *l = container_of(listener, struct vhost_vdpa_listener, l);
+    struct vhost_vdpa *v = l->v;
     struct vhost_dev *dev = v->dev;
     struct vhost_msg_v2 msg = {};
     int fd = v->device_fd;
@@ -211,10 +213,10 @@ static void vhost_vdpa_iommu_map_notify(IOMMUNotifier *n, IOMMUTLBEntry *iotlb)
     RCU_READ_LOCK_GUARD();
     /* check if RAM section out of device range */
     llend = int128_add(int128_makes64(iotlb->addr_mask), int128_makes64(iova));
-    if (int128_gt(llend, int128_make64(v->iova_range.last))) {
+    if (int128_gt(llend, int128_make64(v->listener->iova_range.last))) {
         error_report("RAM section out of device range (max=0x%" PRIx64
                      ", end addr=0x%" PRIx64 ")",
-                     v->iova_range.last, int128_get64(llend));
+                     v->listener->iova_range.last, int128_get64(llend));
         return;
     }
 
@@ -245,7 +247,8 @@ static void vhost_vdpa_iommu_map_notify(IOMMUNotifier *n, IOMMUTLBEntry *iotlb)
 static void vhost_vdpa_iommu_region_add(MemoryListener *listener,
                                         MemoryRegionSection *section)
 {
-    struct vhost_vdpa *v = container_of(listener, struct vhost_vdpa, listener);
+    struct vhost_vdpa_listener *l = container_of(listener, struct vhost_vdpa_listener, l);
+    struct vhost_vdpa *v = l->v;
 
     struct vdpa_iommu *iommu;
     Int128 end;
@@ -286,7 +289,8 @@ static void vhost_vdpa_iommu_region_add(MemoryListener *listener,
 static void vhost_vdpa_iommu_region_del(MemoryListener *listener,
                                         MemoryRegionSection *section)
 {
-    struct vhost_vdpa *v = container_of(listener, struct vhost_vdpa, listener);
+    struct vhost_vdpa_listener *l = container_of(listener, struct vhost_vdpa_listener, l);
+    struct vhost_vdpa *v = l->v;
 
     struct vdpa_iommu *iommu;
 
@@ -306,14 +310,15 @@ static void vhost_vdpa_listener_region_add(MemoryListener *listener,
                                            MemoryRegionSection *section)
 {
     DMAMap mem_region = {};
-    struct vhost_vdpa *v = container_of(listener, struct vhost_vdpa, listener);
+    struct vhost_vdpa_listener *l = container_of(listener, struct vhost_vdpa_listener, l);
+    struct vhost_vdpa *v = l->v;
     hwaddr iova;
     Int128 llend, llsize;
     void *vaddr;
     int ret;
 
-    if (vhost_vdpa_listener_skipped_section(section, v->iova_range.first,
-                                            v->iova_range.last)) {
+    if (vhost_vdpa_listener_skipped_section(section, l->iova_range.first,
+                                            l->iova_range.last)) {
         return;
     }
     if (memory_region_is_iommu(section->mr)) {
@@ -354,7 +359,7 @@ static void vhost_vdpa_listener_region_add(MemoryListener *listener,
         mem_region.size = int128_get64(llsize) - 1,
         mem_region.perm = IOMMU_ACCESS_FLAG(true, section->readonly),
 
-        r = vhost_iova_tree_map_alloc(v->iova_tree, &mem_region);
+        r = vhost_iova_tree_map_alloc(v->listener->iova_tree, &mem_region);
         if (unlikely(r != IOVA_OK)) {
             error_report("Can't allocate a mapping (%d)", r);
             goto fail;
@@ -375,7 +380,7 @@ static void vhost_vdpa_listener_region_add(MemoryListener *listener,
 
 fail_map:
     if (v->shadow_data) {
-        vhost_iova_tree_remove(v->iova_tree, mem_region);
+        vhost_iova_tree_remove(v->listener->iova_tree, mem_region);
     }
 
 fail:
@@ -392,13 +397,14 @@ fail:
 static void vhost_vdpa_listener_region_del(MemoryListener *listener,
                                            MemoryRegionSection *section)
 {
-    struct vhost_vdpa *v = container_of(listener, struct vhost_vdpa, listener);
+    struct vhost_vdpa_listener *l = container_of(listener, struct vhost_vdpa_listener, l);
+    struct vhost_vdpa *v = l->v;
     hwaddr iova;
     Int128 llend, llsize;
     int ret;
 
-    if (vhost_vdpa_listener_skipped_section(section, v->iova_range.first,
-                                            v->iova_range.last)) {
+    if (vhost_vdpa_listener_skipped_section(section, l->iova_range.first,
+                                            l->iova_range.last)) {
         return;
     }
     if (memory_region_is_iommu(section->mr)) {
@@ -435,13 +441,13 @@ static void vhost_vdpa_listener_region_del(MemoryListener *listener,
             .size = int128_get64(llsize) - 1,
         };
 
-        result = vhost_iova_tree_find_iova(v->iova_tree, &mem_region);
+        result = vhost_iova_tree_find_iova(v->listener->iova_tree, &mem_region);
         if (!result) {
             /* The memory listener map wasn't mapped */
             return;
         }
         iova = result->iova;
-        vhost_iova_tree_remove(v->iova_tree, *result);
+        vhost_iova_tree_remove(v->listener->iova_tree, *result);
     }
     vhost_vdpa_iotlb_batch_begin_once(v);
     /*
@@ -576,6 +582,8 @@ static void vhost_vdpa_init_svq(struct vhost_dev *hdev, struct vhost_vdpa *v)
     v->shadow_vqs = g_steal_pointer(&shadow_vqs);
 }
 
+static int vhost_vdpa_set_backend_cap(struct vhost_dev *dev);
+
 static int vhost_vdpa_init(struct vhost_dev *dev, void *opaque, Error **errp)
 {
     struct vhost_vdpa *v;
@@ -586,14 +594,17 @@ static int vhost_vdpa_init(struct vhost_dev *dev, void *opaque, Error **errp)
     v = opaque;
     v->dev = dev;
     dev->opaque =  opaque ;
-    v->listener = vhost_vdpa_memory_listener;
     v->msg_type = VHOST_IOTLB_MSG_V2;
     vhost_vdpa_init_svq(dev, v);
 
     error_propagate(&dev->migration_blocker, v->migration_blocker);
+
     if (!vhost_vdpa_first_dev(dev)) {
         return 0;
     }
+
+    v->listener->l = vhost_vdpa_memory_listener;
+    v->listener->registered = false;
 
     /*
      * If dev->shadow_vqs_enabled at initialization that means the device has
@@ -622,6 +633,21 @@ static int vhost_vdpa_init(struct vhost_dev *dev, void *opaque, Error **errp)
 
     vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_ACKNOWLEDGE |
                                VIRTIO_CONFIG_S_DRIVER);
+
+    /* XXX refactoring needed */
+    if (runstate_check(RUN_STATE_INMIGRATE)) {
+        ret = vhost_vdpa_set_backend_cap(dev);
+        if (ret) {
+            ram_block_discard_disable(false);
+            error_report("Cannot negotiate vdpa backend features");
+            return ret;
+        }
+        struct vhost_vdpa_listener *lr = v->listener;
+        lr->iova_tree = vhost_iova_tree_new(lr->iova_range.first,
+                                           lr->iova_range.last);
+        memory_listener_register(&lr->l, &address_space_memory);
+        lr->registered = true;
+    }
 
     return 0;
 }
@@ -750,7 +776,10 @@ static int vhost_vdpa_cleanup(struct vhost_dev *dev)
     }
 
     vhost_vdpa_host_notifiers_uninit(dev, dev->nvqs);
-    memory_listener_unregister(&v->listener);
+    if (vhost_vdpa_last_dev(dev) && v->listener->registered) {
+        memory_listener_unregister(&v->listener->l);
+        v->listener->registered = false;
+    }
     vhost_vdpa_svq_cleanup(dev);
 
     dev->opaque = NULL;
@@ -831,7 +860,9 @@ static int vhost_vdpa_set_backend_cap(struct vhost_dev *dev)
     uint64_t f = 0x1ULL << VHOST_BACKEND_F_IOTLB_MSG_V2 |
         0x1ULL << VHOST_BACKEND_F_IOTLB_BATCH |
         0x1ULL << VHOST_BACKEND_F_IOTLB_ASID |
-        0x1ULL << VHOST_BACKEND_F_SUSPEND;
+        0x1ULL << VHOST_BACKEND_F_SUSPEND |
+        0x1ULL << VHOST_BACKEND_F_DESC_ASID |
+        0x1ULL << VHOST_BACKEND_F_IOTLB_PERSIST;
     int r;
 
     if (vhost_vdpa_call(dev, VHOST_GET_BACKEND_FEATURES, &features)) {
@@ -1058,7 +1089,7 @@ static void vhost_vdpa_svq_unmap_ring(struct vhost_vdpa *v, hwaddr addr)
     const DMAMap needle = {
         .translated_addr = addr,
     };
-    const DMAMap *result = vhost_iova_tree_find_iova(v->iova_tree, &needle);
+    const DMAMap *result = vhost_iova_tree_find_iova(v->listener->iova_tree, &needle);
     hwaddr size;
     int r;
 
@@ -1074,7 +1105,7 @@ static void vhost_vdpa_svq_unmap_ring(struct vhost_vdpa *v, hwaddr addr)
         return;
     }
 
-    vhost_iova_tree_remove(v->iova_tree, *result);
+    vhost_iova_tree_remove(v->listener->iova_tree, *result);
 }
 
 static void vhost_vdpa_svq_unmap_rings(struct vhost_dev *dev,
@@ -1102,7 +1133,7 @@ static bool vhost_vdpa_svq_map_ring(struct vhost_vdpa *v, DMAMap *needle,
 {
     int r;
 
-    r = vhost_iova_tree_map_alloc(v->iova_tree, needle);
+    r = vhost_iova_tree_map_alloc(v->listener->iova_tree, needle);
     if (unlikely(r != IOVA_OK)) {
         error_setg(errp, "Cannot allocate iova (%d)", r);
         return false;
@@ -1114,7 +1145,7 @@ static bool vhost_vdpa_svq_map_ring(struct vhost_vdpa *v, DMAMap *needle,
                            needle->perm == IOMMU_RO);
     if (unlikely(r != 0)) {
         error_setg_errno(errp, -r, "Cannot map region to device");
-        vhost_iova_tree_remove(v->iova_tree, *needle);
+        vhost_iova_tree_remove(v->listener->iova_tree, *needle);
     }
 
     return r == 0;
@@ -1216,7 +1247,8 @@ static bool vhost_vdpa_svqs_start(struct vhost_dev *dev)
         }
 
         vhost_svq_start(svq, dev->vdev, vq,
-                        v->desc_group >= 0 && v->address_space_id ? NULL : v->iova_tree);
+                        v->desc_group >= 0 && v->address_space_id ?
+                        NULL : v->listener->iova_tree);
         ok = vhost_vdpa_svq_map_rings(dev, svq, &addr, &err);
         if (unlikely(!ok)) {
             goto err_map;
@@ -1319,7 +1351,10 @@ static int vhost_vdpa_dev_start(struct vhost_dev *dev, bool started)
                          "IOMMU and try again");
             return -1;
         }
-        memory_listener_register(&v->listener, dev->vdev->dma_as);
+        if (!v->listener->registered) {
+            memory_listener_register(&v->listener->l, &address_space_memory);
+            v->listener->registered = true;
+        }
 
         return vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_DRIVER_OK);
     }
@@ -1338,7 +1373,15 @@ static void vhost_vdpa_reset_status(struct vhost_dev *dev)
     vhost_vdpa_reset_device(dev);
     vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_ACKNOWLEDGE |
                                VIRTIO_CONFIG_S_DRIVER);
-    memory_listener_unregister(&v->listener);
+
+    trace_vhost_vdpa_flush_map(dev, v->listener->registered, v->svq_flush,
+                               !!(dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_IOTLB_PERSIST)));
+    if (v->listener->registered &&
+        (v->svq_flush ||
+        !(dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_IOTLB_PERSIST)))) {
+        memory_listener_unregister(&v->listener->l);
+        v->listener->registered = false;
+    }
 }
 
 static int vhost_vdpa_set_log_base(struct vhost_dev *dev, uint64_t base,

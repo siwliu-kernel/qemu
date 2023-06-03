@@ -26,3 +26,4 @@ colo_filter_rewriter_conn_offset(uint32_t offset) ": offset=%u"
 
 # vhost-vdpa.c
 vhost_vdpa_set_address_space_id(void *v, unsigned vq_group, unsigned asid_num) "vhost_vdpa: %p vq_group: %u asid: %u"
+vhost_vdpa_net_data_poll(void *s, int qindex, int svq_switch, bool svq_flush) "vhost_vdpa: %p qp: %d svq_switch: %d svq_flush: %d"

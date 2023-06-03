@@ -29,6 +29,8 @@
 #include "migration/migration.h"
 #include "migration/misc.h"
 #include "hw/virtio/vhost.h"
+#include "hw/virtio/vhost.h"
+#include "trace.h"
 
 /* Todo:need to add the multiqueue support here */
 typedef struct VhostVDPAState {
@@ -230,10 +232,16 @@ static void vhost_vdpa_cleanup(NetClientState *nc)
         g_free(s->vhost_net);
         s->vhost_net = NULL;
     }
-     if (s->vhost_vdpa.device_fd >= 0) {
+    if (s->vhost_vdpa.device_fd >= 0) {
         qemu_close(s->vhost_vdpa.device_fd);
         s->vhost_vdpa.device_fd = -1;
     }
+    if (--s->vhost_vdpa.listener->ref == 0) {
+        g_clear_pointer(&s->vhost_vdpa.listener->iova_tree,
+                        vhost_iova_tree_delete);
+        g_free(s->vhost_vdpa.listener);
+    }
+    s->vhost_vdpa.listener = NULL;
 }
 
 static bool vhost_vdpa_has_vnet_hdr(NetClientState *nc)
@@ -274,13 +282,18 @@ static ssize_t vhost_vdpa_receive(NetClientState *nc, const uint8_t *buf,
     return size;
 }
 
-/** From any vdpa net client, get the netclient of the first queue pair */
-static VhostVDPAState *vhost_vdpa_net_first_nc_vdpa(VhostVDPAState *s)
+/** From any vdpa net client, get the netclient of the i-th queue pair */
+static VhostVDPAState *vhost_vdpa_net_get_nc_vdpa(VhostVDPAState *s, int i)
 {
     NICState *nic = qemu_get_nic(s->nc.peer);
-    NetClientState *nc0 = qemu_get_peer(nic->ncs, 0);
+    NetClientState *nc_i = qemu_get_peer(nic->ncs, i);
 
-    return DO_UPCAST(VhostVDPAState, nc, nc0);
+    return DO_UPCAST(VhostVDPAState, nc, nc_i);
+}
+
+static VhostVDPAState *vhost_vdpa_net_first_nc_vdpa(VhostVDPAState *s)
+{
+    return vhost_vdpa_net_get_nc_vdpa(s, 0);
 }
 
 static void vhost_vdpa_net_log_global_enable(VhostVDPAState *s, bool enable)
@@ -304,6 +317,8 @@ static void vhost_vdpa_net_log_global_enable(VhostVDPAState *s, bool enable)
     data_queue_pairs = n->multiqueue ? n->max_queue_pairs : 1;
     cvq = virtio_vdev_has_feature(vdev, VIRTIO_NET_F_CTRL_VQ) ?
                                   n->max_ncs - n->max_queue_pairs : 0;
+    v->svq_switch = enable ? 1 : -1;
+
     /*
      * TODO: vhost_net_stop does suspend, get_base and reset. We can be smarter
      * in the future and resume the device if read-only operations between
@@ -316,6 +331,7 @@ static void vhost_vdpa_net_log_global_enable(VhostVDPAState *s, bool enable)
     if (unlikely(r < 0)) {
         error_report("unable to start vhost net: %s(%d)", g_strerror(-r), -r);
     }
+    v->svq_switch = 0;
 }
 
 static int vhost_vdpa_set_address_space_id(struct vhost_vdpa *v,
@@ -354,6 +370,7 @@ static void vdpa_net_migration_state_notifier(Notifier *notifier, void *data)
 static void vhost_vdpa_net_data_start_first(VhostVDPAState *s)
 {
     struct vhost_vdpa *v = &s->vhost_vdpa;
+    struct vhost_vdpa_listener *l = v->listener;
     int r;
 
     add_migration_state_change_notifier(&s->migration_state);
@@ -367,8 +384,8 @@ static void vhost_vdpa_net_data_start_first(VhostVDPAState *s)
         return;
     }
 
-    v->iova_tree = vhost_iova_tree_new(v->iova_range.first,
-                                       v->iova_range.last);
+    l->iova_tree = vhost_iova_tree_new(l->iova_range.first,
+                                       l->iova_range.last);
 
     if (s->always_svq || v->desc_group < 0)
         return;
@@ -412,7 +429,6 @@ static int vhost_vdpa_net_data_start(NetClientState *nc)
 
     if (v->shadow_vqs_enabled) {
         VhostVDPAState *s0 = vhost_vdpa_net_first_nc_vdpa(s);
-        v->iova_tree = s0->vhost_vdpa.iova_tree;
         v->address_space_id = s0->vhost_vdpa.address_space_id;
         v->shadow_data = s0->vhost_vdpa.shadow_data;
     }
@@ -439,18 +455,36 @@ static int vhost_vdpa_net_data_load(NetClientState *nc)
 static void vhost_vdpa_net_client_stop(NetClientState *nc)
 {
     VhostVDPAState *s = DO_UPCAST(VhostVDPAState, nc, nc);
-    struct vhost_dev *dev;
 
     assert(nc->info->type == NET_CLIENT_DRIVER_VHOST_VDPA);
 
     if (s->vhost_vdpa.index == 0) {
         remove_migration_state_change_notifier(&s->migration_state);
     }
+}
 
-    dev = s->vhost_vdpa.dev;
-    if (dev->vq_index + dev->nvqs == dev->vq_index_end) {
-        g_clear_pointer(&s->vhost_vdpa.iova_tree, vhost_iova_tree_delete);
+/* TODO: abusing .poll seems mispurposed, but is there better way? */
+static void vhost_vdpa_net_data_poll(NetClientState *nc, bool stop)
+{
+    VhostVDPAState *s = DO_UPCAST(VhostVDPAState, nc, nc);
+    VhostVDPAState *s0 = vhost_vdpa_net_first_nc_vdpa(s);
+    struct vhost_vdpa *v = &s->vhost_vdpa;
+
+    if (!stop)
+        return;
+
+    if (s->vhost_vdpa.index == 0) {
+        if (s->always_svq)
+            v->svq_flush = true;
+        else if (!v->svq_switch || v->desc_group >= 0)
+            v->svq_flush = false;
+        else
+            v->svq_flush = true;
+    } else {
+        v->svq_flush = s0->vhost_vdpa.svq_flush;
     }
+
+    trace_vhost_vdpa_net_data_poll(v, s->vhost_vdpa.index, v->svq_switch, v->svq_flush);
 }
 
 static NetClientInfo net_vhost_vdpa_info = {
@@ -459,6 +493,7 @@ static NetClientInfo net_vhost_vdpa_info = {
         .receive = vhost_vdpa_receive,
         .start = vhost_vdpa_net_data_start,
         .load = vhost_vdpa_net_data_load,
+        .poll = vhost_vdpa_net_data_poll,
         .stop = vhost_vdpa_net_client_stop,
         .cleanup = vhost_vdpa_cleanup,
         .has_vnet_hdr = vhost_vdpa_has_vnet_hdr,
@@ -502,7 +537,7 @@ static int64_t vhost_vdpa_get_vring_desc_group(int device_fd, unsigned vq_index,
 
 static void vhost_vdpa_cvq_unmap_buf(struct vhost_vdpa *v, void *addr)
 {
-    VhostIOVATree *tree = v->iova_tree;
+    VhostIOVATree *tree = v->listener->iova_tree;
     DMAMap needle = {
         /*
          * No need to specify size or to look for more translations since
@@ -536,7 +571,7 @@ static int vhost_vdpa_cvq_map_buf(struct vhost_vdpa *v, void *buf, size_t size,
     map.translated_addr = (hwaddr)(uintptr_t)buf;
     map.size = size - 1;
     map.perm = write ? IOMMU_RW : IOMMU_RO,
-    r = vhost_iova_tree_map_alloc(v->iova_tree, &map);
+    r = vhost_iova_tree_map_alloc(v->listener->iova_tree, &map);
     if (unlikely(r != IOVA_OK)) {
         error_report("Cannot map injected element");
         return r;
@@ -551,7 +586,7 @@ static int vhost_vdpa_cvq_map_buf(struct vhost_vdpa *v, void *buf, size_t size,
     return 0;
 
 dma_map_err:
-    vhost_iova_tree_remove(v->iova_tree, map);
+    vhost_iova_tree_remove(v->listener->iova_tree, map);
     return r;
 }
 
@@ -562,11 +597,13 @@ static int vhost_vdpa_net_cvq_start(NetClientState *nc)
     int64_t cvq_group;
     int r;
     Error *err = NULL;
+    struct vhost_vdpa_listener *l;
 
     assert(nc->info->type == NET_CLIENT_DRIVER_VHOST_VDPA);
 
     s = DO_UPCAST(VhostVDPAState, nc, nc);
     v = &s->vhost_vdpa;
+    l = v->listener;
 
     s0 = vhost_vdpa_net_first_nc_vdpa(s);
     v->shadow_data = s0->vhost_vdpa.shadow_data;
@@ -615,7 +652,7 @@ out:
         return 0;
     }
 
-    if (s0->vhost_vdpa.iova_tree) {
+    if (!l->iova_tree) {
         /*
          * SVQ is already configured for all virtqueues.  Reuse IOVA tree for
          * simplicity, whether CVQ shares ASID with guest or not, because:
@@ -629,10 +666,8 @@ out:
          * To allocate a iova tree per ASID is doable but it complicates the
          * code and it is not worth it for the moment.
          */
-        v->iova_tree = s0->vhost_vdpa.iova_tree;
-    } else {
-        v->iova_tree = vhost_iova_tree_new(v->iova_range.first,
-                                           v->iova_range.last);
+        l->iova_tree = vhost_iova_tree_new(l->iova_range.first,
+                                           l->iova_range.last);
     }
 
     r = vhost_vdpa_cvq_map_buf(&s->vhost_vdpa, s->cvq_cmd_out_buffer,
@@ -648,6 +683,24 @@ out:
     }
 
     return r;
+}
+
+/* TODO: Maybe merge with the same .poll op of data vq's ? */
+static void vhost_vdpa_net_cvq_poll(NetClientState *nc, bool stop)
+{
+    VhostVDPAState *s = DO_UPCAST(VhostVDPAState, nc, nc);
+    VhostVDPAState *s0 = vhost_vdpa_net_first_nc_vdpa(s);
+    struct vhost_vdpa *v = &s->vhost_vdpa;
+
+    if (!stop)
+        return;
+
+    if (s0->always_svq)
+        v->svq_flush = true;
+    else if (!s0->vhost_vdpa.svq_switch && !s0->vhost_vdpa.svq_flush)
+        v->svq_flush = false;
+    else
+        v->svq_flush = true;
 }
 
 static void vhost_vdpa_net_cvq_stop(NetClientState *nc)
@@ -1078,6 +1131,7 @@ static NetClientInfo net_vhost_vdpa_cvq_info = {
     .receive = vhost_vdpa_receive,
     .start = vhost_vdpa_net_cvq_start,
     .load = vhost_vdpa_net_cvq_load,
+    .poll = vhost_vdpa_net_cvq_poll,
     .stop = vhost_vdpa_net_cvq_stop,
     .cleanup = vhost_vdpa_cleanup,
     .has_vnet_hdr = vhost_vdpa_has_vnet_hdr,
@@ -1515,7 +1569,7 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
                                        int nvqs,
                                        bool is_datapath,
                                        bool svq,
-                                       struct vhost_vdpa_iova_range iova_range,
+                                       struct vhost_vdpa_listener *l,
                                        uint64_t features,
                                        Error **errp)
 {
@@ -1547,11 +1601,13 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
     s->vhost_vdpa.index = queue_pair_index;
     s->always_svq = svq;
     s->migration_state.notify = vdpa_net_migration_state_notifier;
+    s->vhost_vdpa.listener = l;
     s->vhost_vdpa.shadow_vqs_enabled = svq;
-    s->vhost_vdpa.iova_range = iova_range;
     s->vhost_vdpa.shadow_data = svq;
     s->vhost_vdpa.address_space_id = VHOST_VDPA_GUEST_PA_ASID;
     if (queue_pair_index == 0) {
+        l->v = &s->vhost_vdpa;
+        l->ref++;
         vhost_vdpa_net_valid_svq_features(features,
                                           &s->vhost_vdpa.migration_blocker);
     } else if (!is_datapath) {
@@ -1568,8 +1624,7 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
     }
     ret = vhost_vdpa_add(nc, (void *)&s->vhost_vdpa, queue_pair_index, nvqs);
     if (ret) {
-        qemu_del_net_client(nc);
-        return NULL;
+            goto err;
     }
     if (queue_pair_index == 0) {
         /* 
@@ -1579,12 +1634,19 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
         ret = vhost_vdpa_probe_desc_group(vdpa_device_fd, features,
                                           0, &desc_group, errp);
         if (unlikely(ret < 0)) {
-            qemu_del_net_client(nc);
-            return NULL;
+            goto err;
         }
     }
     s->vhost_vdpa.desc_group = desc_group;
     return nc;
+
+err:
+    if (queue_pair_index == 0) {
+        l->v = NULL;
+        l->ref--;
+    }
+    qemu_del_net_client(nc);
+    return NULL;
 }
 
 static int vhost_vdpa_get_features(int fd, uint64_t *features, Error **errp)
@@ -1637,6 +1699,7 @@ int net_init_vhost_vdpa(const Netdev *netdev, const char *name,
     uint64_t features;
     int vdpa_device_fd;
     g_autofree NetClientState **ncs = NULL;
+    struct vhost_vdpa_listener *mls;
     struct vhost_vdpa_iova_range iova_range;
     NetClientState *nc;
     int queue_pairs, r, i = 0, has_cvq = 0;
@@ -1693,25 +1756,29 @@ int net_init_vhost_vdpa(const Netdev *netdev, const char *name,
     }
 
     ncs = g_malloc0(sizeof(*ncs) * queue_pairs);
+    mls = g_malloc0(sizeof(struct vhost_vdpa_listener));
+    mls->iova_range = iova_range;
 
     for (i = 0; i < queue_pairs; i++) {
         ncs[i] = net_vhost_vdpa_init(peer, TYPE_VHOST_VDPA, name,
                                      vdpa_device_fd, i, 2, true, opts->x_svq,
-                                     iova_range, features, errp);
+                                     mls, features, errp);
         if (!ncs[i])
-            goto err;
+            goto init_err;
     }
 
     if (has_cvq) {
         nc = net_vhost_vdpa_init(peer, TYPE_VHOST_VDPA, name,
                                  vdpa_device_fd, i, 1, false,
-                                 opts->x_svq, iova_range, features, errp);
+                                 opts->x_svq, mls, features, errp);
         if (!nc)
-            goto err;
+            goto init_err;
     }
 
     return 0;
 
+init_err:
+    g_free(mls);
 err:
     if (i) {
         for (i--; i >= 0; i--) {

@@ -30,22 +30,25 @@ typedef struct VhostVDPAHostNotifier {
     void *addr;
 } VhostVDPAHostNotifier;
 
+typedef struct vhost_vdpa_listener VhostVDPAMemoryListener;
+
 typedef struct vhost_vdpa {
     int device_fd;
     int index;
     uint32_t msg_type;
     bool iotlb_batch_begin_sent;
     uint32_t address_space_id;
-    MemoryListener listener;
+    VhostVDPAMemoryListener *listener;
     struct vhost_vdpa_iova_range iova_range;
     uint64_t acked_features;
     bool shadow_vqs_enabled;
     /* Vdpa must send shadow addresses as IOTLB key for data queues, not GPA */
     bool shadow_data;
+    /* Flush mappings on reset due to shared address space */
+    bool svq_flush;
+    int svq_switch;
     /* Device suspended successfully */
     bool suspended;
-    /* IOVA mapping used by the Shadow Virtqueue */
-    VhostIOVATree *iova_tree;
     GPtrArray *shadow_vqs;
     const VhostShadowVirtqueueOps *shadow_vq_ops;
     void *shadow_vq_ops_opaque;
@@ -56,6 +59,16 @@ typedef struct vhost_vdpa {
     QLIST_HEAD(, vdpa_iommu) iommu_list;
     IOMMUNotifier n;
 } VhostVDPA;
+
+struct vhost_vdpa_listener {
+    MemoryListener l;
+    bool registered;
+    struct vhost_vdpa_iova_range iova_range;
+    /* IOVA mapping used by the Shadow Virtqueue */
+    VhostIOVATree *iova_tree;
+    struct vhost_vdpa *v;
+    unsigned ref;
+};
 
 int vhost_vdpa_get_iova_range(int fd, struct vhost_vdpa_iova_range *iova_range);
 int vhost_vdpa_set_vring_ready(struct vhost_vdpa *v, unsigned idx);
