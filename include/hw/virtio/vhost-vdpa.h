@@ -38,6 +38,7 @@ typedef struct vhost_vdpa {
     uint32_t address_space_id;
     MemoryListener listener;
     bool registered;
+    bool mlocked;
     struct vhost_vdpa_iova_range iova_range;
     uint64_t acked_features;
     bool shadow_vqs_enabled;

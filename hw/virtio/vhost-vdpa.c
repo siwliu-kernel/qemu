@@ -14,6 +14,7 @@
 #include <linux/vfio.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include "hw/virtio/vhost.h"
 #include "hw/virtio/vhost-backend.h"
 #include "hw/virtio/virtio-net.h"
@@ -444,6 +445,7 @@ static int vhost_vdpa_init(struct vhost_dev *dev, void *opaque, Error **errp)
     dev->opaque =  opaque ;
     v->listener = vhost_vdpa_memory_listener;
     v->registered = false;
+    v->mlocked = false;
     v->msg_type = VHOST_IOTLB_MSG_V2;
     vhost_vdpa_init_svq(dev, v);
 
@@ -638,6 +640,10 @@ static int vhost_vdpa_memslots_limit(struct vhost_dev *dev)
 static int vhost_vdpa_set_mem_table(struct vhost_dev *dev,
                                     struct vhost_memory *mem)
 {
+    struct vhost_vdpa *v = dev->opaque;
+    int ret;
+    int i;
+
     if (!vhost_vdpa_first_dev(dev)) {
         return 0;
     }
@@ -645,7 +651,6 @@ static int vhost_vdpa_set_mem_table(struct vhost_dev *dev,
     trace_vhost_vdpa_set_mem_table(dev, mem->nregions, mem->padding);
     if (trace_event_get_state_backends(TRACE_VHOST_VDPA_SET_MEM_TABLE) &&
         trace_event_get_state_backends(TRACE_VHOST_VDPA_DUMP_REGIONS)) {
-        int i;
         for (i = 0; i < mem->nregions; i++) {
             trace_vhost_vdpa_dump_regions(dev, i,
                                           mem->regions[i].guest_phys_addr,
@@ -658,7 +663,25 @@ static int vhost_vdpa_set_mem_table(struct vhost_dev *dev,
         return -EINVAL;
     }
 
+    if (!v->mlocked)
+        return 0;
+
+    for (i = 0; i < mem->nregions; i++) {
+        ret = mlock((const void *)mem->regions[i].userspace_addr,
+                    mem->regions[i].memory_size);
+        if (ret)
+            goto unlock;
+    }
+    v->mlocked = true;
     return 0;
+
+unlock:
+    int j;
+    for (j = i - 1; j >= 0; j--) {
+        munlock((const void *)mem->regions[j].userspace_addr,
+                mem->regions[j].memory_size);
+    }
+    return -ret;
 }
 
 static int vhost_vdpa_set_features(struct vhost_dev *dev,
