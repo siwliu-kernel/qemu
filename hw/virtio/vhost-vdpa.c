@@ -135,7 +135,7 @@ int vhost_vdpa_dma_unmap(struct vhost_vdpa *v, uint32_t asid, hwaddr iova,
     return ret;
 }
 
-static void vhost_vdpa_listener_begin_batch(struct vhost_vdpa *v)
+static void vhost_vdpa_iotlb_begin_batch(struct vhost_vdpa *v)
 {
     int fd = v->device_fd;
     struct vhost_msg_v2 msg = {
@@ -143,7 +143,7 @@ static void vhost_vdpa_listener_begin_batch(struct vhost_vdpa *v)
         .iotlb.type = VHOST_IOTLB_BATCH_BEGIN,
     };
 
-    trace_vhost_vdpa_listener_begin_batch(v, fd, msg.type, msg.iotlb.type);
+    trace_vhost_vdpa_iotlb_begin_batch(v, fd, msg.type, msg.iotlb.type);
     if (write(fd, &msg, sizeof(msg)) != sizeof(msg)) {
         error_report("failed to write, fd=%d, errno=%d (%s)",
                      fd, errno, strerror(errno));
@@ -154,18 +154,30 @@ static void vhost_vdpa_iotlb_batch_begin_once(struct vhost_vdpa *v)
 {
     if (v->dev->backend_cap & (0x1ULL << VHOST_BACKEND_F_IOTLB_BATCH) &&
         !v->iotlb_batch_begin_sent) {
-        vhost_vdpa_listener_begin_batch(v);
+        vhost_vdpa_iotlb_begin_batch(v);
     }
 
     v->iotlb_batch_begin_sent = true;
 }
 
-static void vhost_vdpa_listener_commit(MemoryListener *listener)
+static void vhost_vdpa_iotlb_end_batch(struct vhost_vdpa *v)
 {
-    struct vhost_vdpa *v = container_of(listener, struct vhost_vdpa, listener);
-    struct vhost_dev *dev = v->dev;
-    struct vhost_msg_v2 msg = {};
     int fd = v->device_fd;
+    struct vhost_msg_v2 msg = {
+        .type = v->msg_type,
+        .iotlb.type = VHOST_IOTLB_BATCH_END,
+    };
+
+    trace_vhost_vdpa_iotlb_end_batch(v, fd, msg.type, msg.iotlb.type);
+    if (write(fd, &msg, sizeof(msg)) != sizeof(msg)) {
+        error_report("failed to write, fd=%d, errno=%d (%s)",
+                     fd, errno, strerror(errno));
+    }
+}
+
+static void vhost_vdpa_iotlb_batch_end_once(struct vhost_vdpa *v)
+{
+    struct vhost_dev *dev = v->dev;
 
     if (!(dev->backend_cap & (0x1ULL << VHOST_BACKEND_F_IOTLB_BATCH))) {
         return;
@@ -175,16 +187,15 @@ static void vhost_vdpa_listener_commit(MemoryListener *listener)
         return;
     }
 
-    msg.type = v->msg_type;
-    msg.iotlb.type = VHOST_IOTLB_BATCH_END;
-
-    trace_vhost_vdpa_listener_commit(v, fd, msg.type, msg.iotlb.type);
-    if (write(fd, &msg, sizeof(msg)) != sizeof(msg)) {
-        error_report("failed to write, fd=%d, errno=%d (%s)",
-                     fd, errno, strerror(errno));
-    }
-
+    vhost_vdpa_iotlb_end_batch(v);
     v->iotlb_batch_begin_sent = false;
+}
+
+static void vhost_vdpa_listener_commit(MemoryListener *listener)
+{
+    struct vhost_vdpa *v = container_of(listener, struct vhost_vdpa, listener);
+
+    vhost_vdpa_iotlb_batch_end_once(v);
 }
 
 static void vhost_vdpa_listener_region_add(MemoryListener *listener,
