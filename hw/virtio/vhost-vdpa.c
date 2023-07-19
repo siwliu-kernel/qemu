@@ -142,11 +142,12 @@ int vhost_vdpa_dma_unmap(struct vhost_vdpa *v, uint32_t asid, hwaddr iova,
     return ret;
 }
 
-static void vhost_vdpa_iotlb_begin_batch(struct vhost_vdpa *v)
+static void vhost_vdpa_iotlb_begin_batch(struct vhost_vdpa *v, uint32_t asid)
 {
     int fd = v->device_fd;
     struct vhost_msg_v2 msg = {
         .type = v->msg_type,
+        .asid = asid,
         .iotlb.type = VHOST_IOTLB_BATCH_BEGIN,
     };
 
@@ -157,21 +158,35 @@ static void vhost_vdpa_iotlb_begin_batch(struct vhost_vdpa *v)
     }
 }
 
-static void vhost_vdpa_iotlb_batch_begin_once(struct vhost_vdpa *v)
+int vhost_vdpa_iotlb_batch_begin_once(struct vhost_vdpa *v, uint32_t asid)
 {
-    if (v->dev->backend_cap & (0x1ULL << VHOST_BACKEND_F_IOTLB_BATCH) &&
-        !v->iotlb_batch_begin_sent) {
-        vhost_vdpa_iotlb_begin_batch(v);
+    struct vhost_dev *dev = v->dev;
+
+    if (!(dev->backend_cap & (0x1ULL << VHOST_BACKEND_F_IOTLB_BATCH))) {
+        return 0;
     }
 
+    if (v->iotlb_batch_begin_sent && v->iotlb_batch_asid != asid) {
+        return -1;
+    }
+
+    if (v->iotlb_batch_begin_sent) {
+        return 0;
+    }
+
+    vhost_vdpa_iotlb_begin_batch(v, asid);
     v->iotlb_batch_begin_sent = true;
+    v->iotlb_batch_asid = asid;
+
+    return 0;
 }
 
-static void vhost_vdpa_iotlb_end_batch(struct vhost_vdpa *v)
+static void vhost_vdpa_iotlb_end_batch(struct vhost_vdpa *v, uint32_t asid)
 {
     int fd = v->device_fd;
     struct vhost_msg_v2 msg = {
         .type = v->msg_type,
+        .asid = asid,
         .iotlb.type = VHOST_IOTLB_BATCH_END,
     };
 
@@ -182,20 +197,27 @@ static void vhost_vdpa_iotlb_end_batch(struct vhost_vdpa *v)
     }
 }
 
-static void vhost_vdpa_iotlb_batch_end_once(struct vhost_vdpa *v)
+int vhost_vdpa_iotlb_batch_end_once(struct vhost_vdpa *v, uint32_t asid)
 {
     struct vhost_dev *dev = v->dev;
 
     if (!(dev->backend_cap & (0x1ULL << VHOST_BACKEND_F_IOTLB_BATCH))) {
-        return;
+        return 0;
     }
 
     if (!v->iotlb_batch_begin_sent) {
-        return;
+        return 0;
     }
 
-    vhost_vdpa_iotlb_end_batch(v);
+    if (v->iotlb_batch_asid != asid) {
+        return -1;
+    }
+
+    vhost_vdpa_iotlb_end_batch(v, asid);
     v->iotlb_batch_begin_sent = false;
+    v->iotlb_batch_asid = -1;
+
+    return 0;
 }
 
 static void vhost_vdpa_listener_commit(MemoryListener *listener)
@@ -203,7 +225,7 @@ static void vhost_vdpa_listener_commit(MemoryListener *listener)
     struct vhost_vdpa_listener *l = container_of(listener, struct vhost_vdpa_listener, l);
     struct vhost_vdpa *v = l->v;
 
-    vhost_vdpa_iotlb_batch_end_once(v);
+    vhost_vdpa_iotlb_batch_end_once(v, VHOST_VDPA_GUEST_PA_ASID);
 }
 
 static void vhost_vdpa_iommu_map_notify(IOMMUNotifier *n, IOMMUTLBEntry *iotlb)
@@ -326,7 +348,7 @@ static void vhost_vdpa_listener_region_add(MemoryListener *listener,
     hwaddr iova;
     Int128 llend, llsize;
     void *vaddr;
-    int ret;
+    int ret, r;
 
     if (vhost_vdpa_listener_skipped_section(section, l->iova_range.first,
                                             l->iova_range.last)) {
@@ -364,7 +386,6 @@ static void vhost_vdpa_listener_region_add(MemoryListener *listener,
 
     llsize = int128_sub(llend, int128_make64(iova));
     if (v->shadow_data) {
-        int r;
 
         mem_region.translated_addr = (hwaddr)(uintptr_t)vaddr,
         mem_region.size = int128_get64(llsize) - 1,
@@ -379,7 +400,11 @@ static void vhost_vdpa_listener_region_add(MemoryListener *listener,
         iova = mem_region.iova;
     }
 
-    vhost_vdpa_iotlb_batch_begin_once(v);
+    r = vhost_vdpa_iotlb_batch_begin_once(v, VHOST_VDPA_GUEST_PA_ASID);
+    if (unlikely(r)) {
+            error_report("Can't batch mapping on asid 0 (%p)", v);
+            goto fail_map;
+    }
     ret = vhost_vdpa_dma_map(v, VHOST_VDPA_GUEST_PA_ASID, iova,
                              int128_get64(llsize), vaddr, section->readonly);
     if (ret) {
@@ -460,7 +485,11 @@ static void vhost_vdpa_listener_region_del(MemoryListener *listener,
         iova = result->iova;
         vhost_iova_tree_remove(v->listener->iova_tree, *result);
     }
-    vhost_vdpa_iotlb_batch_begin_once(v);
+    ret = vhost_vdpa_iotlb_batch_begin_once(v, VHOST_VDPA_GUEST_PA_ASID);
+    if (ret) {
+            error_report("Can't batch mapping on asid 0 (%p)", v);
+    }
+
     /*
      * The unmap ioctl doesn't accept a full 64-bit. need to check it
      */
@@ -606,6 +635,13 @@ static int vhost_vdpa_init(struct vhost_dev *dev, void *opaque, Error **errp)
     v->dev = dev;
     dev->opaque =  opaque ;
     v->msg_type = VHOST_IOTLB_MSG_V2;
+
+    ret = vhost_vdpa_set_backend_cap(dev);
+    if (unlikely(ret)) {
+        error_setg_errno(errp, -ret, "Cannot negotiate vdpa backend features");
+        return ret;
+    }
+
     vhost_vdpa_init_svq(dev, v);
 
     error_propagate(&dev->migration_blocker, v->migration_blocker);
@@ -647,12 +683,6 @@ static int vhost_vdpa_init(struct vhost_dev *dev, void *opaque, Error **errp)
 
     /* XXX refactoring needed */
     if (runstate_check(RUN_STATE_INMIGRATE)) {
-        ret = vhost_vdpa_set_backend_cap(dev);
-        if (ret) {
-            ram_block_discard_disable(false);
-            error_report("Cannot negotiate vdpa backend features");
-            return ret;
-        }
         struct vhost_vdpa_listener *lr = v->listener;
         lr->iova_tree = vhost_iova_tree_new(lr->iova_range.first,
                                            lr->iova_range.last);
@@ -1245,6 +1275,7 @@ static bool vhost_vdpa_svqs_start(struct vhost_dev *dev)
         return true;
     }
 
+    vhost_vdpa_iotlb_batch_begin_once(v, v->address_space_id);
     for (i = 0; i < v->shadow_vqs->len; ++i) {
         VirtQueue *vq = virtio_get_queue(dev->vdev, dev->vq_index + i);
         VhostShadowVirtqueue *svq = g_ptr_array_index(v->shadow_vqs, i);
@@ -1272,6 +1303,7 @@ static bool vhost_vdpa_svqs_start(struct vhost_dev *dev)
             goto err_set_addr;
         }
     }
+    vhost_vdpa_iotlb_batch_end_once(v, v->address_space_id);
 
     return true;
 
@@ -1288,6 +1320,7 @@ err:
         vhost_vdpa_svq_unmap_rings(dev, svq);
         vhost_svq_stop(svq);
     }
+    vhost_vdpa_iotlb_batch_end_once(v, v->address_space_id);
 
     return false;
 }
@@ -1300,6 +1333,7 @@ static void vhost_vdpa_svqs_stop(struct vhost_dev *dev)
         return;
     }
 
+    vhost_vdpa_iotlb_batch_begin_once(v, v->address_space_id);
     for (unsigned i = 0; i < v->shadow_vqs->len; ++i) {
         VhostShadowVirtqueue *svq = g_ptr_array_index(v->shadow_vqs, i);
 
@@ -1309,6 +1343,7 @@ static void vhost_vdpa_svqs_stop(struct vhost_dev *dev)
         event_notifier_cleanup(&svq->hdev_kick);
         event_notifier_cleanup(&svq->hdev_call);
     }
+    vhost_vdpa_iotlb_batch_end_once(v, v->address_space_id);
 }
 
 static void vhost_vdpa_suspend(struct vhost_dev *dev)

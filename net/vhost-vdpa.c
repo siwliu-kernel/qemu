@@ -670,10 +670,11 @@ out:
                                            l->iova_range.last);
     }
 
+    vhost_vdpa_iotlb_batch_begin_once(v, v->address_space_id);
     r = vhost_vdpa_cvq_map_buf(&s->vhost_vdpa, s->cvq_cmd_out_buffer,
                                vhost_vdpa_net_cvq_cmd_page_len(), false);
     if (unlikely(r < 0)) {
-        return r;
+        goto err;
     }
 
     r = vhost_vdpa_cvq_map_buf(&s->vhost_vdpa, s->status,
@@ -682,6 +683,8 @@ out:
         vhost_vdpa_cvq_unmap_buf(&s->vhost_vdpa, s->cvq_cmd_out_buffer);
     }
 
+err:
+    vhost_vdpa_iotlb_batch_end_once(v, v->address_space_id);
     return r;
 }
 
@@ -1617,6 +1620,8 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
     s->vhost_vdpa.shadow_vqs_enabled = svq;
     s->vhost_vdpa.shadow_data = svq;
     s->vhost_vdpa.address_space_id = VHOST_VDPA_GUEST_PA_ASID;
+    s->vhost_vdpa.iotlb_batch_begin_sent = false;
+    s->vhost_vdpa.iotlb_batch_asid = -1;
     if (queue_pair_index == 0) {
         l->v = &s->vhost_vdpa;
         l->ref++;

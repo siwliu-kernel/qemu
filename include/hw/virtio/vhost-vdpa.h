@@ -37,6 +37,7 @@ typedef struct vhost_vdpa {
     int index;
     uint32_t msg_type;
     bool iotlb_batch_begin_sent;
+    uint32_t iotlb_batch_asid;
     uint32_t address_space_id;
     VhostVDPAMemoryListener *listener;
     struct vhost_vdpa_iova_range iova_range;
@@ -77,6 +78,8 @@ int vhost_vdpa_dma_map(struct vhost_vdpa *v, uint32_t asid, hwaddr iova,
                        hwaddr size, void *vaddr, bool readonly);
 int vhost_vdpa_dma_unmap(struct vhost_vdpa *v, uint32_t asid, hwaddr iova,
                          hwaddr size);
+int vhost_vdpa_iotlb_batch_begin_once(struct vhost_vdpa *v, uint32_t asid);
+int vhost_vdpa_iotlb_batch_end_once(struct vhost_vdpa *v, uint32_t asid);
 
 typedef struct vdpa_iommu {
     struct vhost_vdpa *dev;
