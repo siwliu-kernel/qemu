@@ -1109,6 +1109,7 @@ static bool vhost_vdpa_svqs_start(struct vhost_dev *dev)
         return true;
     }
 
+    vhost_vdpa_iotlb_batch_begin_once(v);
     for (i = 0; i < v->shadow_vqs->len; ++i) {
         VirtQueue *vq = virtio_get_queue(dev->vdev, dev->vq_index + i);
         VhostShadowVirtqueue *svq = g_ptr_array_index(v->shadow_vqs, i);
@@ -1134,6 +1135,7 @@ static bool vhost_vdpa_svqs_start(struct vhost_dev *dev)
             goto err_set_addr;
         }
     }
+    vhost_vdpa_iotlb_batch_end_once(v);
 
     return true;
 
@@ -1150,6 +1152,7 @@ err:
         vhost_vdpa_svq_unmap_rings(dev, svq);
         vhost_svq_stop(svq);
     }
+    vhost_vdpa_iotlb_batch_end_once(v);
 
     return false;
 }
@@ -1162,6 +1165,7 @@ static void vhost_vdpa_svqs_stop(struct vhost_dev *dev)
         return;
     }
 
+    vhost_vdpa_iotlb_batch_begin_once(v);
     for (unsigned i = 0; i < v->shadow_vqs->len; ++i) {
         VhostShadowVirtqueue *svq = g_ptr_array_index(v->shadow_vqs, i);
 
@@ -1171,6 +1175,7 @@ static void vhost_vdpa_svqs_stop(struct vhost_dev *dev)
         event_notifier_cleanup(&svq->hdev_kick);
         event_notifier_cleanup(&svq->hdev_call);
     }
+    vhost_vdpa_iotlb_batch_end_once(v);
 }
 
 static void vhost_vdpa_suspend(struct vhost_dev *dev)
