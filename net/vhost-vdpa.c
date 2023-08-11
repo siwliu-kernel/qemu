@@ -768,8 +768,13 @@ static ssize_t vhost_vdpa_net_load_cmd(VhostVDPAState *s, uint8_t class,
     iov_to_buf(data_sg, data_num, 0,
                s->cvq_cmd_out_buffer + sizeof(ctrl), data_size);
 
-    return vhost_vdpa_net_cvq_add(s, data_size + sizeof(ctrl),
+    trace_vhost_vdpa_net_load_cmd(s, class, cmd, data_num, data_size);
+
+    ssize_t r = vhost_vdpa_net_cvq_add(s, data_size + sizeof(ctrl),
                                   sizeof(virtio_net_ctrl_ack));
+
+    trace_vhost_vdpa_net_load_cmd_retval(s, class, cmd, r);
+    return r;
 }
 
 static int vhost_vdpa_net_load_mac(VhostVDPAState *s, const VirtIONet *n)
@@ -860,6 +865,7 @@ static int vhost_vdpa_net_load_mq(VhostVDPAState *s,
         .iov_base = &mq,
         .iov_len = sizeof(mq),
     };
+    trace_vhost_vdpa_net_load_mq(s, n->curr_queue_pairs);
     dev_written = vhost_vdpa_net_load_cmd(s, VIRTIO_NET_CTRL_MQ,
                                           VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET,
                                           &data, 1);
