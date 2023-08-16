@@ -318,6 +318,26 @@ static void vhost_vdpa_net_log_global_enable(VhostVDPAState *s, bool enable)
     }
 }
 
+static int vhost_vdpa_set_address_space_id(struct vhost_vdpa *v,
+                                           unsigned vq_group,
+                                           unsigned asid_num)
+{
+    struct vhost_vring_state asid = {
+        .index = vq_group,
+        .num = asid_num,
+    };
+    int r;
+
+    trace_vhost_vdpa_set_address_space_id(v, vq_group, asid_num);
+
+    r = ioctl(v->device_fd, VHOST_VDPA_SET_GROUP_ASID, &asid);
+    if (unlikely(r < 0)) {
+        error_report("Can't set vq group %u asid %u, errno=%d (%s)",
+                     asid.index, asid.num, errno, g_strerror(errno));
+    }
+    return r;
+}
+
 static void vdpa_net_migration_state_notifier(Notifier *notifier, void *data)
 {
     MigrationState *migration = data;
@@ -334,12 +354,36 @@ static void vdpa_net_migration_state_notifier(Notifier *notifier, void *data)
 static void vhost_vdpa_net_data_start_first(VhostVDPAState *s)
 {
     struct vhost_vdpa *v = &s->vhost_vdpa;
+    int r;
 
     add_migration_state_change_notifier(&s->migration_state);
-    if (v->shadow_vqs_enabled) {
-        v->iova_tree = vhost_iova_tree_new(v->iova_range.first,
-                                           v->iova_range.last);
+    if (!v->shadow_vqs_enabled) {
+        if (v->desc_group >= 0) {
+            r = vhost_vdpa_set_address_space_id(v, v->desc_group,
+                                                VHOST_VDPA_GUEST_PA_ASID);
+            assert(r == 0);
+            s->vhost_vdpa.address_space_id = VHOST_VDPA_GUEST_PA_ASID;
+        }
+        return;
     }
+
+    v->iova_tree = vhost_iova_tree_new(v->iova_range.first,
+                                       v->iova_range.last);
+
+    if (s->always_svq || v->desc_group < 0)
+        return;
+
+    /* 
+     * TODO revisit this assumption where the group of all data vqs is
+     * same as that of the first vq
+     */
+    r = vhost_vdpa_set_address_space_id(v, v->desc_group, VHOST_VDPA_NET_CVQ_ASID);
+    if (unlikely(r < 0)) {
+        return;
+    }
+
+    s->vhost_vdpa.address_space_id = VHOST_VDPA_NET_CVQ_ASID;
+    v->shadow_data = false;
 }
 
 static int vhost_vdpa_net_data_start(NetClientState *nc)
@@ -352,6 +396,9 @@ static int vhost_vdpa_net_data_start(NetClientState *nc)
     if (s->always_svq ||
         migration_is_setup_or_active(migrate_get_current()->state)) {
         v->shadow_vqs_enabled = true;
+        /* GPA->HIOVA translation needed when there's no cvq, where
+         * memory listerner is hooked to the last data vq
+         */
         v->shadow_data = true;
     } else {
         v->shadow_vqs_enabled = false;
@@ -366,6 +413,8 @@ static int vhost_vdpa_net_data_start(NetClientState *nc)
     if (v->shadow_vqs_enabled) {
         VhostVDPAState *s0 = vhost_vdpa_net_first_nc_vdpa(s);
         v->iova_tree = s0->vhost_vdpa.iova_tree;
+        v->address_space_id = s0->vhost_vdpa.address_space_id;
+        v->shadow_data = s0->vhost_vdpa.shadow_data;
     }
 
     return 0;
@@ -434,22 +483,21 @@ static int64_t vhost_vdpa_get_vring_group(int device_fd, unsigned vq_index,
     return state.num;
 }
 
-static int vhost_vdpa_set_address_space_id(struct vhost_vdpa *v,
-                                           unsigned vq_group,
-                                           unsigned asid_num)
+static int64_t vhost_vdpa_get_vring_desc_group(int device_fd, unsigned vq_index,
+                                          Error **errp)
 {
-    struct vhost_vring_state asid = {
-        .index = vq_group,
-        .num = asid_num,
+    struct vhost_vring_state state = {
+        .index = vq_index,
     };
-    int r;
+    int r = ioctl(device_fd, VHOST_VDPA_GET_VRING_DESC_GROUP, &state);
 
-    r = ioctl(v->device_fd, VHOST_VDPA_SET_GROUP_ASID, &asid);
     if (unlikely(r < 0)) {
-        error_report("Can't set vq group %u asid %u, errno=%d (%s)",
-                     asid.index, asid.num, errno, g_strerror(errno));
+        r = -errno;
+        error_setg_errno(errp, errno, "Cannot get VQ %u descriptor group", vq_index);
+        return r;
     }
-    return r;
+
+    return state.num;
 }
 
 static void vhost_vdpa_cvq_unmap_buf(struct vhost_vdpa *v, void *addr)
@@ -521,11 +569,15 @@ static int vhost_vdpa_net_cvq_start(NetClientState *nc)
     v = &s->vhost_vdpa;
 
     s0 = vhost_vdpa_net_first_nc_vdpa(s);
-    v->shadow_data = s0->vhost_vdpa.shadow_vqs_enabled;
+    v->shadow_data = s0->vhost_vdpa.shadow_data;
     v->shadow_vqs_enabled = s0->vhost_vdpa.shadow_vqs_enabled;
     s->vhost_vdpa.address_space_id = VHOST_VDPA_GUEST_PA_ASID;
 
     if (s->vhost_vdpa.shadow_data) {
+        /*
+         * TODO take care of the case without isolated cvq,
+         * but data vq has dedicated descriptor group
+         */
         /* SVQ is already configured for all virtqueues */
         goto out;
     }
@@ -1276,6 +1328,94 @@ static const VhostShadowVirtqueueOps vhost_vdpa_net_svq_ops = {
     .avail_handler = vhost_vdpa_net_handle_ctrl_avail,
 };
 
+static int vhost_vdpa_probe_desc_group(int device_fd, uint64_t features,
+                                       int vq_index, int64_t *desc_grpidx,
+                                       Error **errp)
+{
+    uint64_t backend_features;
+    int64_t vq_group;
+    uint8_t saved_status = 0;
+    uint8_t status = 0;
+    int r;
+
+    ERRP_GUARD();
+
+    r = ioctl(device_fd, VHOST_VDPA_GET_STATUS, &saved_status);
+    if (unlikely(r)) {
+        error_setg_errno(errp, -r, "Cannot get device status");
+        goto out;
+    }
+
+    r = ioctl(device_fd, VHOST_VDPA_SET_STATUS, &status);
+    if (unlikely(r)) {
+        error_setg_errno(errp, -r, "Cannot reset device");
+        goto out;
+    }
+
+    r = ioctl(device_fd, VHOST_GET_BACKEND_FEATURES, &backend_features);
+    if (unlikely(r < 0)) {
+        error_setg_errno(errp, errno, "Cannot get vdpa backend_features");
+        return r;
+    }
+
+    if (!(backend_features & BIT_ULL(VHOST_BACKEND_F_IOTLB_ASID))) {
+        return 0;
+    }
+
+    if (!(backend_features & BIT_ULL(VHOST_BACKEND_F_DESC_ASID))) {
+        return 0;
+    }
+
+    r = ioctl(device_fd, VHOST_SET_FEATURES, &features);
+    if (unlikely(r)) {
+        error_setg_errno(errp, errno, "Cannot set features");
+    }
+
+    status = VIRTIO_CONFIG_S_ACKNOWLEDGE |
+             VIRTIO_CONFIG_S_DRIVER |
+             VIRTIO_CONFIG_S_FEATURES_OK;
+
+    r = ioctl(device_fd, VHOST_VDPA_SET_STATUS, &status);
+    if (unlikely(r)) {
+        error_setg_errno(errp, -r, "Cannot set device features");
+        goto out;
+    }
+
+    vq_group = vhost_vdpa_get_vring_group(device_fd, vq_index, errp);
+    if (unlikely(vq_group < 0)) {
+        if (vq_group != -ENOTSUP) {
+            r = vq_group;
+            goto out;
+        }
+
+        /*
+         * The kernel report VHOST_BACKEND_F_IOTLB_ASID if the vdpa frontend
+         * support ASID even if the parent driver does not.
+         */
+        error_free(*errp);
+        *errp = NULL;
+        r = 0;
+        goto out;
+    }
+
+    int64_t desc_group = vhost_vdpa_get_vring_desc_group(device_fd,
+                                                         vq_index, errp);
+    if (unlikely(desc_group < 0)) {
+        r = desc_group;
+        goto out;
+    } else if (desc_group != vq_group) {
+        *desc_grpidx = desc_group;
+    }
+    r = 1;
+
+out:
+    status = 0;
+    ioctl(device_fd, VHOST_VDPA_SET_STATUS, &status);
+    if (saved_status)
+        ioctl(device_fd, VHOST_VDPA_SET_STATUS, &saved_status);
+    return r;
+}
+
 /**
  * Probe if CVQ is isolated
  *
@@ -1286,7 +1426,8 @@ static const VhostShadowVirtqueueOps vhost_vdpa_net_svq_ops = {
  * Returns <0 in case of failure, 0 if false and 1 if true.
  */
 static int vhost_vdpa_probe_cvq_isolation(int device_fd, uint64_t features,
-                                          int cvq_index, Error **errp)
+                                          int cvq_index, int64_t *desc_grpidx,
+                                          Error **errp)
 {
     uint64_t backend_features;
     int64_t cvq_group;
@@ -1336,6 +1477,13 @@ static int vhost_vdpa_probe_cvq_isolation(int device_fd, uint64_t features,
         goto out;
     }
 
+    if (backend_features & BIT_ULL(VHOST_BACKEND_F_DESC_ASID)) {
+        int64_t desc_group = vhost_vdpa_get_vring_desc_group(device_fd,
+                                                             cvq_index, errp);
+        if (likely(desc_group >= 0) && desc_group != cvq_group)
+            *desc_grpidx = desc_group;
+    }
+
     for (int i = 0; i < cvq_index; ++i) {
         int64_t group = vhost_vdpa_get_vring_group(device_fd, i, errp);
         if (unlikely(group < 0)) {
@@ -1354,6 +1502,8 @@ static int vhost_vdpa_probe_cvq_isolation(int device_fd, uint64_t features,
 out:
     status = 0;
     ioctl(device_fd, VHOST_VDPA_SET_STATUS, &status);
+    status = VIRTIO_CONFIG_S_ACKNOWLEDGE | VIRTIO_CONFIG_S_DRIVER;
+    ioctl(device_fd, VHOST_VDPA_SET_STATUS, &status);
     return r;
 }
 
@@ -1371,6 +1521,7 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
 {
     NetClientState *nc = NULL;
     VhostVDPAState *s;
+    int64_t desc_group = -1;
     int ret = 0;
     assert(name);
     int cvq_isolated;
@@ -1381,7 +1532,7 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
     } else {
         cvq_isolated = vhost_vdpa_probe_cvq_isolation(vdpa_device_fd, features,
                                                       queue_pair_index * 2,
-                                                      errp);
+                                                      &desc_group, errp);
         if (unlikely(cvq_isolated < 0)) {
             return NULL;
         }
@@ -1399,6 +1550,7 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
     s->vhost_vdpa.shadow_vqs_enabled = svq;
     s->vhost_vdpa.iova_range = iova_range;
     s->vhost_vdpa.shadow_data = svq;
+    s->vhost_vdpa.address_space_id = VHOST_VDPA_GUEST_PA_ASID;
     if (queue_pair_index == 0) {
         vhost_vdpa_net_valid_svq_features(features,
                                           &s->vhost_vdpa.migration_blocker);
@@ -1419,6 +1571,19 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
         qemu_del_net_client(nc);
         return NULL;
     }
+    if (queue_pair_index == 0) {
+        /* 
+         * TODO revisit this assumption where the group of all data vqs is
+         * same as that of the first vq
+         */
+        ret = vhost_vdpa_probe_desc_group(vdpa_device_fd, features,
+                                          0, &desc_group, errp);
+        if (unlikely(ret < 0)) {
+            qemu_del_net_client(nc);
+            return NULL;
+        }
+    }
+    s->vhost_vdpa.desc_group = desc_group;
     return nc;
 }
 

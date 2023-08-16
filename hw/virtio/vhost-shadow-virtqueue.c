@@ -136,7 +136,7 @@ static bool vhost_svq_translate_addr(const VhostShadowVirtqueue *svq,
  * Return true if success, false otherwise and print error.
  */
 static bool vhost_svq_vring_write_descs(VhostShadowVirtqueue *svq, hwaddr *sg,
-                                        const struct iovec *iovec, size_t num,
+                                        const struct iovec *iovec, hwaddr *addr, size_t num,
                                         bool more_descs, bool write)
 {
     uint16_t i = svq->free_head, last = svq->free_head;
@@ -149,8 +149,15 @@ static bool vhost_svq_vring_write_descs(VhostShadowVirtqueue *svq, hwaddr *sg,
         return true;
     }
 
-    ok = vhost_svq_translate_addr(svq, sg, iovec, num);
-    if (unlikely(!ok)) {
+    if (svq->iova_tree) {
+        ok = vhost_svq_translate_addr(svq, sg, iovec, num);
+        if (unlikely(!ok)) {
+            return false;
+        }
+    } else if (!addr) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "No translation found for vaddr 0x%p\n",
+                      iovec[0].iov_base);
         return false;
     }
 
@@ -161,7 +168,7 @@ static bool vhost_svq_vring_write_descs(VhostShadowVirtqueue *svq, hwaddr *sg,
         } else {
             descs[i].flags = flags;
         }
-        descs[i].addr = cpu_to_le64(sg[n]);
+        descs[i].addr = cpu_to_le64(svq->iova_tree ? sg[n] : addr[n]);
         descs[i].len = cpu_to_le32(iovec[n].iov_len);
 
         last = i;
@@ -173,8 +180,8 @@ static bool vhost_svq_vring_write_descs(VhostShadowVirtqueue *svq, hwaddr *sg,
 }
 
 static bool vhost_svq_add_split(VhostShadowVirtqueue *svq,
-                                const struct iovec *out_sg, size_t out_num,
-                                const struct iovec *in_sg, size_t in_num,
+                                const struct iovec *out_sg, hwaddr *out_addr, size_t out_num,
+                                const struct iovec *in_sg, hwaddr *in_addr, size_t in_num,
                                 unsigned *head)
 {
     unsigned avail_idx;
@@ -191,13 +198,13 @@ static bool vhost_svq_add_split(VhostShadowVirtqueue *svq,
         return false;
     }
 
-    ok = vhost_svq_vring_write_descs(svq, sgs, out_sg, out_num, in_num > 0,
+    ok = vhost_svq_vring_write_descs(svq, sgs, out_sg, out_addr, out_num, in_num > 0,
                                      false);
     if (unlikely(!ok)) {
         return false;
     }
 
-    ok = vhost_svq_vring_write_descs(svq, sgs, in_sg, in_num, false, true);
+    ok = vhost_svq_vring_write_descs(svq, sgs, in_sg, in_addr, in_num, false, true);
     if (unlikely(!ok)) {
         return false;
     }
@@ -258,7 +265,8 @@ int vhost_svq_add(VhostShadowVirtqueue *svq, const struct iovec *out_sg,
         return -ENOSPC;
     }
 
-    ok = vhost_svq_add_split(svq, out_sg, out_num, in_sg, in_num, &qemu_head);
+    ok = vhost_svq_add_split(svq, out_sg, elem ? elem->out_addr : NULL, out_num,
+                             in_sg, elem ? elem->in_addr : NULL, in_num, &qemu_head);
     if (unlikely(!ok)) {
         return -EINVAL;
     }
