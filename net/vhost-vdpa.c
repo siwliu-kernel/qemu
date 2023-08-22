@@ -697,10 +697,16 @@ static void vhost_vdpa_net_cvq_poll(NetClientState *nc, bool stop)
 
     if (s0->always_svq)
         v->svq_flush = true;
-    else if (!s0->vhost_vdpa.svq_switch && !s0->vhost_vdpa.svq_flush)
+    else if (!s0->vhost_vdpa.svq_switch)
+        v->svq_flush = false;
+    else if (!s0->vhost_vdpa.svq_flush && s->cvq_isolated)
         v->svq_flush = false;
     else
         v->svq_flush = true;
+
+    trace_vhost_vdpa_net_cvq_poll(v, s->vhost_vdpa.index,
+                                  s0->vhost_vdpa.svq_switch,
+                                  v->svq_flush);
 }
 
 static void vhost_vdpa_net_cvq_stop(NetClientState *nc)
