@@ -49,6 +49,7 @@ static bool vhost_vdpa_listener_skipped_section(MemoryRegionSection *section,
 
     if ((!memory_region_is_ram(section->mr) &&
          !memory_region_is_iommu(section->mr)) ||
+        memory_region_is_rom(section->mr) ||
         memory_region_is_protected(section->mr) ||
         /* vhost-vDPA doesn't allow MMIO to be mapped  */
         memory_region_is_ram_device(section->mr)) {
