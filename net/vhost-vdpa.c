@@ -715,12 +715,15 @@ static void vhost_vdpa_net_cvq_poll(NetClientState *nc, bool stop)
 static void vhost_vdpa_net_cvq_stop(NetClientState *nc)
 {
     VhostVDPAState *s = DO_UPCAST(VhostVDPAState, nc, nc);
+    struct vhost_vdpa *v = &s->vhost_vdpa;
 
     assert(nc->info->type == NET_CLIENT_DRIVER_VHOST_VDPA);
 
     if (s->vhost_vdpa.shadow_vqs_enabled) {
+        vhost_vdpa_iotlb_batch_begin_once(v, v->address_space_id);
         vhost_vdpa_cvq_unmap_buf(&s->vhost_vdpa, s->cvq_cmd_out_buffer);
         vhost_vdpa_cvq_unmap_buf(&s->vhost_vdpa, s->status);
+        vhost_vdpa_iotlb_batch_end_once(v, v->address_space_id);
     }
 
     vhost_vdpa_net_client_stop(nc);
