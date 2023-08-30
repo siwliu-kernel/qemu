@@ -1150,8 +1150,8 @@ static void vhost_vdpa_svq_unmap_ring(struct vhost_vdpa *v, hwaddr addr)
     vhost_iova_tree_remove(v->listener->iova_tree, *result);
 }
 
-static void vhost_vdpa_svq_unmap_rings(struct vhost_dev *dev,
-                                       const VhostShadowVirtqueue *svq)
+void vhost_vdpa_svq_unmap_rings(struct vhost_dev *dev,
+                                const VhostShadowVirtqueue *svq)
 {
     struct vhost_vdpa *v = dev->opaque;
     struct vhost_vring_addr svq_addr;
@@ -1334,17 +1334,14 @@ static void vhost_vdpa_svqs_stop(struct vhost_dev *dev)
         return;
     }
 
-    vhost_vdpa_iotlb_batch_begin_once(v, v->address_space_id);
     for (unsigned i = 0; i < v->shadow_vqs->len; ++i) {
         VhostShadowVirtqueue *svq = g_ptr_array_index(v->shadow_vqs, i);
 
         vhost_svq_stop(svq);
-        vhost_vdpa_svq_unmap_rings(dev, svq);
 
         event_notifier_cleanup(&svq->hdev_kick);
         event_notifier_cleanup(&svq->hdev_call);
     }
-    vhost_vdpa_iotlb_batch_end_once(v, v->address_space_id);
 }
 
 static void vhost_vdpa_suspend(struct vhost_dev *dev)

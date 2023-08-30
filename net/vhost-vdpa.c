@@ -29,7 +29,7 @@
 #include "migration/migration.h"
 #include "migration/misc.h"
 #include "hw/virtio/vhost.h"
-#include "hw/virtio/vhost.h"
+#include "hw/virtio/vhost-vdpa.h"
 #include "trace.h"
 
 /* Todo:need to add the multiqueue support here */
@@ -452,14 +452,83 @@ static int vhost_vdpa_net_data_load(NetClientState *nc)
     return 0;
 }
 
+static void vhost_vdpa_cvq_unmap_buf(struct vhost_vdpa *v, void *addr)
+{
+    VhostIOVATree *tree = v->listener->iova_tree;
+    DMAMap needle = {
+        /*
+         * No need to specify size or to look for more translations since
+         * this contiguous chunk was allocated by us.
+         */
+        .translated_addr = (hwaddr)(uintptr_t)addr,
+    };
+    const DMAMap *map = vhost_iova_tree_find_iova(tree, &needle);
+    int r;
+
+    if (unlikely(!map)) {
+        error_report("Cannot locate expected map");
+        return;
+    }
+
+    r = vhost_vdpa_dma_unmap(v, v->address_space_id, map->iova, map->size + 1);
+    if (unlikely(r != 0)) {
+        error_report("Device cannot unmap: %s(%d)", g_strerror(r), r);
+    }
+
+    vhost_iova_tree_remove(tree, *map);
+}
+
+
 static void vhost_vdpa_net_client_stop(NetClientState *nc)
 {
     VhostVDPAState *s = DO_UPCAST(VhostVDPAState, nc, nc);
+    struct vhost_vdpa *v = &s->vhost_vdpa;
+    struct vhost_vdpa *last_vi = NULL;
+    bool has_cvq = v->dev->vq_index_end % 2;
+    int nvqp;
 
     assert(nc->info->type == NET_CLIENT_DRIVER_VHOST_VDPA);
 
     if (s->vhost_vdpa.index == 0) {
         remove_migration_state_change_notifier(&s->migration_state);
+        return;
+    }
+
+    if (v->dev->vq_index + v->dev->nvqs != v->dev->vq_index_end)
+        return;
+
+    /* TODO revisit the assumption */
+    nvqp = (v->dev->vq_index_end + 1) / 2;
+    for (int i = 0; i < nvqp; ++i) {
+        VhostVDPAState *s_i = vhost_vdpa_net_get_nc_vdpa(s, i);
+        struct vhost_vdpa *v_i = &s_i->vhost_vdpa;
+
+        if (!v_i->shadow_vqs_enabled)
+            continue;
+        if (!last_vi) {
+            vhost_vdpa_iotlb_batch_begin_once(v_i, v_i->address_space_id);
+            last_vi = v_i;
+        } else if (last_vi->address_space_id != v_i->address_space_id) {
+            vhost_vdpa_iotlb_batch_end_once(last_vi, last_vi->address_space_id);
+            vhost_vdpa_iotlb_batch_begin_once(v_i, v_i->address_space_id);
+            last_vi = v_i;
+        }
+
+        for (unsigned j = 0; j < v_i->shadow_vqs->len; ++j) {
+            VhostShadowVirtqueue *svq = g_ptr_array_index(v_i->shadow_vqs, j);
+
+            vhost_vdpa_svq_unmap_rings(v_i->dev, svq);
+        }
+    }
+    if (has_cvq) {
+        if (last_vi)
+            assert(last_vi->address_space_id == v->address_space_id);
+        vhost_vdpa_cvq_unmap_buf(&s->vhost_vdpa, s->cvq_cmd_out_buffer);
+        vhost_vdpa_cvq_unmap_buf(&s->vhost_vdpa, s->status);
+    }
+    if (last_vi) {
+        vhost_vdpa_iotlb_batch_end_once(last_vi, last_vi->address_space_id);
+        last_vi = NULL;
     }
 }
 
@@ -533,32 +602,6 @@ static int64_t vhost_vdpa_get_vring_desc_group(int device_fd, unsigned vq_index,
     }
 
     return state.num;
-}
-
-static void vhost_vdpa_cvq_unmap_buf(struct vhost_vdpa *v, void *addr)
-{
-    VhostIOVATree *tree = v->listener->iova_tree;
-    DMAMap needle = {
-        /*
-         * No need to specify size or to look for more translations since
-         * this contiguous chunk was allocated by us.
-         */
-        .translated_addr = (hwaddr)(uintptr_t)addr,
-    };
-    const DMAMap *map = vhost_iova_tree_find_iova(tree, &needle);
-    int r;
-
-    if (unlikely(!map)) {
-        error_report("Cannot locate expected map");
-        return;
-    }
-
-    r = vhost_vdpa_dma_unmap(v, v->address_space_id, map->iova, map->size + 1);
-    if (unlikely(r != 0)) {
-        error_report("Device cannot unmap: %s(%d)", g_strerror(r), r);
-    }
-
-    vhost_iova_tree_remove(tree, *map);
 }
 
 /** Map CVQ buffer. */
@@ -714,17 +757,7 @@ static void vhost_vdpa_net_cvq_poll(NetClientState *nc, bool stop)
 
 static void vhost_vdpa_net_cvq_stop(NetClientState *nc)
 {
-    VhostVDPAState *s = DO_UPCAST(VhostVDPAState, nc, nc);
-    struct vhost_vdpa *v = &s->vhost_vdpa;
-
     assert(nc->info->type == NET_CLIENT_DRIVER_VHOST_VDPA);
-
-    if (s->vhost_vdpa.shadow_vqs_enabled) {
-        vhost_vdpa_iotlb_batch_begin_once(v, v->address_space_id);
-        vhost_vdpa_cvq_unmap_buf(&s->vhost_vdpa, s->cvq_cmd_out_buffer);
-        vhost_vdpa_cvq_unmap_buf(&s->vhost_vdpa, s->status);
-        vhost_vdpa_iotlb_batch_end_once(v, v->address_space_id);
-    }
 
     vhost_vdpa_net_client_stop(nc);
 }

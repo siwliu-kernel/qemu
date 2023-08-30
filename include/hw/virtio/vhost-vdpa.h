@@ -81,6 +81,9 @@ int vhost_vdpa_dma_unmap(struct vhost_vdpa *v, uint32_t asid, hwaddr iova,
 int vhost_vdpa_iotlb_batch_begin_once(struct vhost_vdpa *v, uint32_t asid);
 int vhost_vdpa_iotlb_batch_end_once(struct vhost_vdpa *v, uint32_t asid);
 
+void vhost_vdpa_svq_unmap_rings(struct vhost_dev *dev,
+                                const VhostShadowVirtqueue *svq);
+
 typedef struct vdpa_iommu {
     struct vhost_vdpa *dev;
     IOMMUMemoryRegion *iommu_mr;
