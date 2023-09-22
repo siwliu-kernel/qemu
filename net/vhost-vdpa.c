@@ -491,7 +491,6 @@ static void vhost_vdpa_net_client_stop(NetClientState *nc)
 
     if (s->vhost_vdpa.index == 0) {
         remove_migration_state_change_notifier(&s->migration_state);
-        return;
     }
 
     if (v->dev->vq_index + v->dev->nvqs != v->dev->vq_index_end)
