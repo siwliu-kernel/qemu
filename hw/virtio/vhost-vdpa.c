@@ -1033,7 +1033,10 @@ static int vhost_vdpa_get_config(struct vhost_dev *dev, uint8_t *config,
 static int vhost_vdpa_set_dev_vring_base(struct vhost_dev *dev,
                                          struct vhost_vring_state *ring)
 {
-    trace_vhost_vdpa_set_vring_base(dev, ring->index, ring->num);
+    struct vhost_vdpa *v = dev->opaque;
+
+    trace_vhost_vdpa_set_vring_base(dev, ring->index, ring->num,
+                                    v->shadow_vqs_enabled);
     return vhost_vdpa_call(dev, VHOST_SET_VRING_BASE, ring);
 }
 
@@ -1488,6 +1491,7 @@ static int vhost_vdpa_get_vring_base(struct vhost_dev *dev,
 
     if (v->shadow_vqs_enabled) {
         ring->num = virtio_queue_get_last_avail_idx(dev->vdev, ring->index);
+        trace_vhost_vdpa_get_vring_base(dev, ring->index, ring->num, true);
         return 0;
     }
 
@@ -1500,7 +1504,7 @@ static int vhost_vdpa_get_vring_base(struct vhost_dev *dev,
     }
 
     ret = vhost_vdpa_call(dev, VHOST_GET_VRING_BASE, ring);
-    trace_vhost_vdpa_get_vring_base(dev, ring->index, ring->num);
+    trace_vhost_vdpa_get_vring_base(dev, ring->index, ring->num, false);
     return ret;
 }
 
