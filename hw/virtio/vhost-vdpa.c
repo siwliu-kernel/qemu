@@ -887,6 +887,11 @@ static int vhost_vdpa_set_features(struct vhost_dev *dev,
         features &= ~BIT_ULL(VHOST_F_LOG_ALL);
     }
 
+    if ((dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_RESUME)) &&
+        dev->suspending) {
+        return 0;
+    }
+
     trace_vhost_vdpa_set_features(dev, features);
     ret = vhost_vdpa_call(dev, VHOST_SET_FEATURES, &features);
     if (ret) {
@@ -903,6 +908,7 @@ static int vhost_vdpa_set_backend_cap(struct vhost_dev *dev)
         0x1ULL << VHOST_BACKEND_F_IOTLB_BATCH |
         0x1ULL << VHOST_BACKEND_F_IOTLB_ASID |
         0x1ULL << VHOST_BACKEND_F_SUSPEND |
+        0x1ULL << VHOST_BACKEND_F_RESUME |
         0x1ULL << VHOST_BACKEND_F_DESC_ASID |
         0x1ULL << VHOST_BACKEND_F_IOTLB_PERSIST;
     int r;
@@ -1283,6 +1289,10 @@ static bool vhost_vdpa_svqs_start(struct vhost_dev *dev)
     for (i = 0; i < v->shadow_vqs->len; ++i) {
         VirtQueue *vq = virtio_get_queue(dev->vdev, dev->vq_index + i);
         VhostShadowVirtqueue *svq = g_ptr_array_index(v->shadow_vqs, i);
+
+        if (svq->vq && svq->vq == vq)
+            continue;
+
         struct vhost_vring_addr addr = {
             .index = dev->vq_index + i,
         };
@@ -1295,6 +1305,7 @@ static bool vhost_vdpa_svqs_start(struct vhost_dev *dev)
         vhost_svq_start(svq, dev->vdev, vq,
                         v->desc_group >= 0 && v->address_space_id ?
                         NULL : v->listener->iova_tree);
+        /* FIXME Specific flag to allow mapping change in SVQ switch */
         ok = vhost_vdpa_svq_map_rings(dev, svq, &addr, &err);
         if (unlikely(!ok)) {
             goto err_map;
@@ -1347,13 +1358,13 @@ static void vhost_vdpa_svqs_stop(struct vhost_dev *dev)
     }
 }
 
-static void vhost_vdpa_suspend(struct vhost_dev *dev)
+static int vhost_vdpa_suspend(struct vhost_dev *dev)
 {
     struct vhost_vdpa *v = dev->opaque;
     int r;
 
     if (!vhost_vdpa_first_dev(dev)) {
-        return;
+        return 0;
     }
 
     if (dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_SUSPEND)) {
@@ -1361,13 +1372,42 @@ static void vhost_vdpa_suspend(struct vhost_dev *dev)
         r = ioctl(v->device_fd, VHOST_VDPA_SUSPEND);
         if (unlikely(r)) {
             error_report("Cannot suspend: %s(%d)", g_strerror(errno), errno);
+            dev->suspending = 0;
         } else {
             v->suspended = true;
-            return;
+            return 0;
         }
     }
 
     vhost_vdpa_reset_device(dev);
+    return r;
+}
+
+static int vhost_vdpa_resume(struct vhost_dev *dev)
+{
+    struct vhost_vdpa *v = dev->opaque;
+    int r;
+
+    if (!vhost_vdpa_last_dev(dev)) {
+        return 0;
+    }
+
+    if (dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_RESUME)) {
+        trace_vhost_vdpa_resume(dev);
+        r = ioctl(v->device_fd, VHOST_VDPA_RESUME);
+        if (unlikely(r)) {
+            error_report("Cannot resume: %s(%d)", g_strerror(errno), errno);
+        } else {
+            v->suspended = false;
+            return 0;
+        }
+    }
+
+    dev->suspending = 0;
+    vhost_vdpa_reset_device(dev);
+    vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_ACKNOWLEDGE |
+                               VIRTIO_CONFIG_S_DRIVER);
+    return -1;
 }
 
 static int vhost_vdpa_dev_start(struct vhost_dev *dev, bool started)
@@ -1375,17 +1415,30 @@ static int vhost_vdpa_dev_start(struct vhost_dev *dev, bool started)
     struct vhost_vdpa *v = dev->opaque;
     bool ok;
     trace_vhost_vdpa_dev_start(dev, started);
+    bool suspensible = dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_SUSPEND);
+    bool resumeable = dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_RESUME);
 
     if (started) {
-        vhost_vdpa_host_notifiers_init(dev);
-        ok = vhost_vdpa_svqs_start(dev);
-        if (unlikely(!ok)) {
-            return -1;
+        if (!(resumeable && dev->suspending == 1)) {
+            vhost_vdpa_host_notifiers_init(dev);
+            ok = vhost_vdpa_svqs_start(dev);
+            if (unlikely(!ok)) {
+                return -1;
+            }
         }
     } else {
         vhost_vdpa_suspend(dev);
-        vhost_vdpa_svqs_stop(dev);
-        vhost_vdpa_host_notifiers_uninit(dev, dev->nvqs);
+        /* Allow minor vring tweak (except vring size change)
+         * for SVQ switching and live migration vm_stop
+         * cases.
+         * On the other hand, if suspend above had failed,
+         * the device must have been reset already. Stop
+         * the device alternatively as a fallback.
+         */
+        if (!(suspensible && dev->suspending == 1)) {
+            vhost_vdpa_svqs_stop(dev);
+            vhost_vdpa_host_notifiers_uninit(dev, dev->nvqs);
+        }
     }
 
     if (!vhost_vdpa_last_dev(dev)) {
@@ -1398,12 +1451,20 @@ static int vhost_vdpa_dev_start(struct vhost_dev *dev, bool started)
                          "IOMMU and try again");
             return -1;
         }
+
+        if (resumeable && dev->suspending) {
+            int r = vhost_vdpa_resume(dev);
+            if (dev->suspending == 1 || unlikely(r))
+                return r;
+        }
+
         if (!v->listener->registered) {
             memory_listener_register(&v->listener->l, &address_space_memory);
             v->listener->registered = true;
         }
 
-        return vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_DRIVER_OK);
+        if (!(resumeable && dev->suspending))
+            return vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_DRIVER_OK);
     }
 
     return 0;
@@ -1417,9 +1478,14 @@ static void vhost_vdpa_reset_status(struct vhost_dev *dev)
         return;
     }
 
-    vhost_vdpa_reset_device(dev);
-    vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_ACKNOWLEDGE |
-                               VIRTIO_CONFIG_S_DRIVER);
+    if (!(dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_RESUME) &&
+          dev->suspending)) {
+        vhost_vdpa_reset_device(dev);
+        vhost_vdpa_add_status(dev, VIRTIO_CONFIG_S_ACKNOWLEDGE |
+                                   VIRTIO_CONFIG_S_DRIVER);
+    } else if (dev->suspending == 1) {
+        return;
+    }
 
     trace_vhost_vdpa_flush_map(dev, v->listener->registered, v->svq_flush,
                                !!(dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_IOTLB_PERSIST)));
@@ -1456,6 +1522,11 @@ static int vhost_vdpa_set_vring_addr(struct vhost_dev *dev,
          */
         return 0;
     }
+    /* FIXME Specific flag to allow vring addr change in SVQ switch */
+    if ((dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_RESUME)) &&
+        dev->suspending == 1) {
+        return 0;
+    }
 
     return vhost_vdpa_set_vring_dev_addr(dev, addr);
 }
@@ -1463,6 +1534,11 @@ static int vhost_vdpa_set_vring_addr(struct vhost_dev *dev,
 static int vhost_vdpa_set_vring_num(struct vhost_dev *dev,
                                       struct vhost_vring_state *ring)
 {
+    /* FIXME validate vring size stays same across SVQ switching */
+    if ((dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_RESUME)) &&
+        dev->suspending) {
+        return 0;
+    }
     trace_vhost_vdpa_set_vring_num(dev, ring->index, ring->num);
     return vhost_vdpa_call(dev, VHOST_SET_VRING_NUM, ring);
 }
@@ -1477,6 +1553,11 @@ static int vhost_vdpa_set_vring_base(struct vhost_dev *dev,
          * Device vring base was set at device start. SVQ base is handled by
          * VirtQueue code.
          */
+        return 0;
+    }
+    /* FIXME Specific flag to allow vring base change in SVQ switch */
+    if ((dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_RESUME)) &&
+        dev->suspending == 1) {
         return 0;
     }
 

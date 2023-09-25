@@ -185,6 +185,8 @@ struct VirtIONet {
     uint8_t nouni;
     uint8_t nobcast;
     uint8_t vhost_started;
+    uint32_t vhost_suspending;
+    uint32_t vhost_suspended;
     struct {
         uint32_t in_use;
         uint32_t first_multi;

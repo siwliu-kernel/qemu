@@ -250,6 +250,18 @@ static void vhost_net_set_vq_index(struct vhost_net *net, int vq_index,
     net->dev.vq_index_end = vq_index_end;
 }
 
+static void vhost_net_get_suspending(struct vhost_net *net,
+                                     uint32_t *suspend_flags)
+{
+    *suspend_flags &= net->dev.suspending;
+}
+
+static void vhost_net_set_suspending(struct vhost_net *net,
+                                     uint32_t suspend_flags)
+{
+    net->dev.suspending = suspend_flags;
+}
+
 static int vhost_net_start_one(struct vhost_net *net,
                                VirtIODevice *dev)
 {
@@ -377,6 +389,7 @@ int vhost_net_start(VirtIODevice *dev, NetClientState *ncs,
 
         net = get_vhost_net(peer);
         vhost_net_set_vq_index(net, i * 2, index_end);
+        vhost_net_set_suspending(net, n->vhost_suspending);
 
         /* Suppress the masking guest notifiers on vhost user
          * because vhost user doesn't interrupt masking/unmasking
@@ -414,14 +427,25 @@ int vhost_net_start(VirtIODevice *dev, NetClientState *ncs,
             goto err_start;
         }
     }
+ 
+    for (i = 0; i < nvhosts; i++) {
+        if (i < data_queue_pairs) {
+            peer = qemu_get_peer(ncs, i);
+        } else {
+            peer = qemu_get_peer(ncs, n->max_queue_pairs);
+        }
+        vhost_net_get_suspending(get_vhost_net(peer), &n->vhost_suspending);
+    }
 
     return 0;
 
 err_start:
+    vhost_net_get_suspending(get_vhost_net(peer), &n->vhost_suspending);
     while (--i >= 0) {
         peer = qemu_get_peer(ncs, i < data_queue_pairs ?
                                   i : n->max_queue_pairs);
         vhost_net_stop_one(get_vhost_net(peer), dev);
+        vhost_net_get_suspending(get_vhost_net(peer), &n->vhost_suspending);
     }
     e = k->set_guest_notifiers(qbus->parent, total_notifiers, false);
     if (e < 0) {
@@ -450,7 +474,9 @@ void vhost_net_stop(VirtIODevice *dev, NetClientState *ncs,
         } else {
             peer = qemu_get_peer(ncs, n->max_queue_pairs);
         }
+        vhost_net_set_suspending(get_vhost_net(peer), n->vhost_suspending);
         vhost_net_stop_one(get_vhost_net(peer), dev);
+        vhost_net_get_suspending(get_vhost_net(peer), &n->vhost_suspending);
     }
 
     r = k->set_guest_notifiers(qbus->parent, total_notifiers, false);

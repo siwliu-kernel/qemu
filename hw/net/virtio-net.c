@@ -267,6 +267,7 @@ static void virtio_net_vhost_status(VirtIONet *n, uint8_t status)
     int queue_pairs = n->multiqueue ? n->max_queue_pairs : 1;
     int cvq = virtio_vdev_has_feature(vdev, VIRTIO_NET_F_CTRL_VQ) ?
               n->max_ncs - n->max_queue_pairs : 0;
+    bool suspending;
 
     if (!get_vhost_net(nc->peer)) {
         return;
@@ -276,6 +277,7 @@ static void virtio_net_vhost_status(VirtIONet *n, uint8_t status)
         !!n->vhost_started) {
         return;
     }
+    suspending = vdev->status == status;
     if (!n->vhost_started) {
         int r, i;
 
@@ -308,16 +310,28 @@ static void virtio_net_vhost_status(VirtIONet *n, uint8_t status)
         }
 
         n->vhost_started = 1;
+        n->vhost_suspending = suspending && n->vhost_suspended ? n->vhost_suspended : 0;
         r = vhost_net_start(vdev, n->nic->ncs, queue_pairs, cvq);
         if (r < 0) {
             error_report("unable to start vhost net: %d: "
                          "falling back on userspace virtio", -r);
             n->vhost_started = 0;
+        } else {
+            /* FIXME clear suspended if device failed to start? */
+            n->vhost_suspended = 0;
         }
     } else {
+        /* FIXME may corrupt internal state with repeated suspend */
+        //if (!suspending || !n->vhost_suspended) {
+        n->vhost_suspending = suspending ?
+            (!vdev->vm_running || nc->peer->link_down ? 2 : 1) : 0;
         vhost_net_stop(vdev, n->nic->ncs, queue_pairs, cvq);
+        if (n->vhost_suspending)
+            n->vhost_suspended = n->vhost_suspending;
         n->vhost_started = 0;
+        //}
     }
+    n->vhost_suspending = 0;
 }
 
 static int virtio_net_set_vnet_endian_one(VirtIODevice *vdev,

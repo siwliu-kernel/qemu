@@ -313,10 +313,11 @@ static void vhost_vdpa_net_log_global_enable(VhostVDPAState *s, bool enable)
     if (!n->vhost_started) {
         return;
     }
-
     data_queue_pairs = n->multiqueue ? n->max_queue_pairs : 1;
     cvq = virtio_vdev_has_feature(vdev, VIRTIO_NET_F_CTRL_VQ) ?
                                   n->max_ncs - n->max_queue_pairs : 0;
+    /* FIXME turn this to a bitmask flag: vhost_suspend_request */
+    n->vhost_suspending = 2;
     v->svq_switch = enable ? 1 : -1;
 
     /*
@@ -332,6 +333,7 @@ static void vhost_vdpa_net_log_global_enable(VhostVDPAState *s, bool enable)
         error_report("unable to start vhost net: %s(%d)", g_strerror(-r), -r);
     }
     v->svq_switch = 0;
+    n->vhost_suspending = 0;
 }
 
 static int vhost_vdpa_set_address_space_id(struct vhost_vdpa *v,
@@ -384,8 +386,10 @@ static void vhost_vdpa_net_data_start_first(VhostVDPAState *s)
         return;
     }
 
-    l->iova_tree = vhost_iova_tree_new(l->iova_range.first,
-                                       l->iova_range.last);
+    if (!l->iova_tree) {
+        l->iova_tree = vhost_iova_tree_new(l->iova_range.first,
+                                           l->iova_range.last);
+    }
 
     if (s->always_svq || v->desc_group < 0)
         return;
@@ -491,6 +495,12 @@ static void vhost_vdpa_net_client_stop(NetClientState *nc)
 
     if (s->vhost_vdpa.index == 0) {
         remove_migration_state_change_notifier(&s->migration_state);
+    }
+
+    /* FIXME specific suspension flag to allow mapping change */
+    if ((v->dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_RESUME)) &&
+        v->dev->suspending) {
+        return;
     }
 
     if (v->dev->vq_index + v->dev->nvqs != v->dev->vq_index_end)
@@ -681,6 +691,8 @@ static int vhost_vdpa_net_cvq_start(NetClientState *nc)
         return cvq_group;
     }
 
+    /* FIXME specific suspension flag to allow ASID change */
+    /* FIXME should disallow ASID change in normal suspend */
     r = vhost_vdpa_set_address_space_id(v, cvq_group, VHOST_VDPA_NET_CVQ_ASID);
     if (unlikely(r < 0)) {
         return r;
@@ -710,6 +722,12 @@ out:
          */
         l->iova_tree = vhost_iova_tree_new(l->iova_range.first,
                                            l->iova_range.last);
+    }
+
+    /* FIXME specific suspension flag to allow mapping change */
+    if ((v->dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_RESUME)) &&
+        v->dev->suspending) {
+        return 0;
     }
 
     vhost_vdpa_iotlb_batch_begin_once(v, v->address_space_id);
@@ -1145,6 +1163,11 @@ static int vhost_vdpa_net_cvq_load(NetClientState *nc)
     int r;
 
     assert(nc->info->type == NET_CLIENT_DRIVER_VHOST_VDPA);
+
+    if ((v->dev->backend_cap & BIT_ULL(VHOST_BACKEND_F_RESUME)) &&
+        v->dev->suspending) {
+        return 0;
+    }
 
     vhost_vdpa_set_vring_ready(v, v->dev->vq_index);
 
