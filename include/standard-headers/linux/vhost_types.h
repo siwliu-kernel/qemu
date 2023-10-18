@@ -185,8 +185,8 @@ struct vhost_vdpa_iova_range {
  * different group for ASID binding than the buffers it contains.
  * Requires VHOST_BACKEND_F_IOTLB_ASID.
  */
-#define VHOST_BACKEND_F_DESC_ASID    0x6
+#define VHOST_BACKEND_F_DESC_ASID    0x7
 /* IOTLB don't flush memory mapping across device reset */
-#define VHOST_BACKEND_F_IOTLB_PERSIST  0x7
+#define VHOST_BACKEND_F_IOTLB_PERSIST  0x8
 
 #endif
