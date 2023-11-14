@@ -395,8 +395,8 @@ static void vhost_vdpa_net_data_start_first(VhostVDPAState *s)
         return;
 
     /* 
-     * TODO revisit this assumption where the group of all data vqs is
-     * same as that of the first vq
+     * TODO revisit this assumption where the group of other data vqs can be
+     * different than that of the first vq
      */
     r = vhost_vdpa_set_address_space_id(v, v->desc_group, VHOST_VDPA_NET_CVQ_ASID);
     if (unlikely(r < 0)) {
@@ -1504,7 +1504,7 @@ static int vhost_vdpa_probe_desc_group(int device_fd, uint64_t features,
 
     r = ioctl(device_fd, VHOST_VDPA_SET_STATUS, &status);
     if (unlikely(r)) {
-        error_setg_errno(errp, -r, "Cannot set device features");
+        error_setg_errno(errp, -r, "Cannot set device status");
         goto out;
     }
 
@@ -1701,10 +1701,10 @@ static NetClientState *net_vhost_vdpa_init(NetClientState *peer,
     if (ret) {
             goto err;
     }
-    if (queue_pair_index == 0) {
+    if (is_datapath) {
         /* 
-         * TODO revisit this assumption where the group of all data vqs is
-         * same as that of the first vq
+         * TODO revisit this assumption where the group of other data vqs
+         * can be different than that of the first vq
          */
         ret = vhost_vdpa_probe_desc_group(vdpa_device_fd, features,
                                           0, &desc_group, errp);
