@@ -1532,7 +1532,10 @@ static int vhost_vdpa_set_vring_call(struct vhost_dev *dev,
 
     /* Remember last call fd because we can switch to SVQ anytime. */
     vhost_svq_set_svq_call_fd(svq, file->fd);
-    if (v->shadow_vqs_enabled) {
+    /* In the event of SVQ switching to off, shadow_vqs_enabled has
+     * not been set to false yet, but the underlying call fd has to
+     * switch back to the guest notifier for passthrough VQs. */
+    if (v->shadow_vqs_enabled && v->svq_switch >= 0) {
         return 0;
     }
 
